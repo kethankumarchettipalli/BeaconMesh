@@ -1,0 +1,440 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: users
+// Document ID: {uid} (Firebase Auth UID)
+// Fields:
+//   - uid: string (required, 1-128 chars, matches doc ID, immutable) - Firebase Auth User UID
+//   - displayName: string (required, 1-100 chars) - User's full or display name
+//   - email: string (required, valid email format, 1-254 chars, immutable on self-update) - Registered email
+//   - photoURL: string or null (optional, valid URL, max 2048 chars) - Avatar image URL
+//   - role: string (required, 'CITIZEN' | 'RESPONDER' | 'COMMAND', self-service restricted to 'CITIZEN') - Access tier
+//   - responderSubtype: string or null (optional, 'PROFESSIONAL' | 'VOLUNTEER' | null) - Field responder classification
+//   - commandLevel: string or null (optional, 'COORDINATOR' | 'ADMINISTRATOR' | null) - Command tier classification
+//   - requestedRole: string or null (optional, 'RESPONDER' | null) - Pending elevated role request
+//   - requestedResponderSubtype: string or null (optional, 'PROFESSIONAL' | 'VOLUNTEER' | null) - Requested responder tier
+//   - approvalStatus: string (required, 'NOT_REQUIRED' | 'PENDING' | 'APPROVED' | 'REJECTED') - Vetting status
+//   - phoneNumber: string or null (optional, max 30 chars) - Contact telephone number
+//   - phoneVerified: bool (required, must be false on creation, immutable on self-update) - SMS verification status
+//   - emailVerified: bool (required, only authenticatable via auth token verification) - Email confirmation flag
+//   - accountStatus: string (required, 'ACTIVE' | 'SUSPENDED') - Account administrative standing
+//   - createdAt: timestamp (required, immutable) - Document creation timestamp
+//   - updatedAt: timestamp (required) - Last modification timestamp
+//   - lastLoginAt: timestamp or null (optional) - Last session activity timestamp
+//
+// Collection: incidents
+// Document ID: {incidentId}
+// Fields:
+//   - id: string (required, 1-64 chars, immutable) - Public incident identifier
+//   - type: string (required, 1-50 chars) - Incident category (Medical, Trapped, Fire, Flood, etc.)
+//   - place: string (required, 1-200 chars) - Location description or geocoded title
+//   - description: string or null (optional, max 2000 chars) - Citizen situational narrative
+//   - status: string (required, 1-50 chars) - Dispatch state (Saved on device, Waiting for connection, Acknowledged, In progress, Resolved)
+//   - priority: string (required, 1-30 chars) - Urgency tier (Critical, High, Moderate, Low)
+//   - createdBy: string (required, 1-128 chars, immutable) - UID of authoring citizen/user
+//   - creatorName: string or null (optional, max 100 chars) - Denormalized author displayName
+//   - creatorPhone: string or null (optional, max 30 chars) - Denormalized contact telephone
+//   - assignedResponderId: string or null (optional, max 128 chars) - UID of responder handling incident
+//   - notes: string or null (optional, max 2000 chars) - Operational field annotations
+//   - createdAt: timestamp (required, immutable) - Incident reporting timestamp
+//   - updatedAt: timestamp (required) - Last incident update timestamp
+//
+// Collection: reports (Alias/compatible collection for citizen incident reports)
+// Document ID: {reportId} (Mirroring incidents schema)
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Core Helper Functions
+    // ===============================================================
+
+    // Check if the request is from an authenticated user
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Check if user owns the document by matching path UID
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Check if document exists in users collection
+    function userExists(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId));
+    }
+
+    // Fetch user profile data from users collection
+    function getUserDoc(userId) {
+      return get(/databases/$(database)/documents/users/$(userId)).data;
+    }
+
+    // Check if authenticated user has an ACTIVE account standing
+    function isActiveUser() {
+      return isAuthenticated() && (
+        ('accountStatus' in request.auth.token && request.auth.token.accountStatus == 'ACTIVE') ||
+        (userExists(request.auth.uid) && getUserDoc(request.auth.uid).accountStatus == 'ACTIVE')
+      );
+    }
+
+    // Check if user is an ACTIVE Command user (COORDINATOR or ADMINISTRATOR)
+    function isCommandUser() {
+      return isAuthenticated() && (
+        (('role' in request.auth.token && request.auth.token.role == 'COMMAND') &&
+         ('commandLevel' in request.auth.token && request.auth.token.commandLevel in ['COORDINATOR', 'ADMINISTRATOR']) &&
+         ('accountStatus' in request.auth.token && request.auth.token.accountStatus == 'ACTIVE'))
+        ||
+        (userExists(request.auth.uid) &&
+         getUserDoc(request.auth.uid).role == 'COMMAND' &&
+         getUserDoc(request.auth.uid).commandLevel in ['COORDINATOR', 'ADMINISTRATOR'] &&
+         getUserDoc(request.auth.uid).accountStatus == 'ACTIVE')
+      );
+    }
+
+    // Check if user is an ACTIVE Administrator
+    function isAdministrator() {
+      return isAuthenticated() && (
+        (('role' in request.auth.token && request.auth.token.role == 'COMMAND') &&
+         ('commandLevel' in request.auth.token && request.auth.token.commandLevel == 'ADMINISTRATOR') &&
+         ('accountStatus' in request.auth.token && request.auth.token.accountStatus == 'ACTIVE'))
+        ||
+        (userExists(request.auth.uid) &&
+         getUserDoc(request.auth.uid).role == 'COMMAND' &&
+         getUserDoc(request.auth.uid).commandLevel == 'ADMINISTRATOR' &&
+         getUserDoc(request.auth.uid).accountStatus == 'ACTIVE')
+      );
+    }
+
+    // Check if user is an ACTIVE Approved Responder
+    function isApprovedResponder() {
+      return isActiveUser() && (
+        (('role' in request.auth.token && request.auth.token.role == 'RESPONDER' &&
+          'approvalStatus' in request.auth.token && request.auth.token.approvalStatus == 'APPROVED'))
+        ||
+        (userExists(request.auth.uid) &&
+         getUserDoc(request.auth.uid).role == 'RESPONDER' &&
+         getUserDoc(request.auth.uid).approvalStatus == 'APPROVED')
+      );
+    }
+
+    // Check if user has active Command role
+    function isCommand() {
+      return isActiveUser() && (
+        (('role' in request.auth.token && request.auth.token.role == 'COMMAND'))
+        ||
+        (userExists(request.auth.uid) &&
+         getUserDoc(request.auth.uid).role == 'COMMAND')
+      );
+    }
+
+    // Validate email format
+    function isValidEmail(email) {
+      return email is string &&
+        email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    // Validate URL format
+    function isValidUrl(url) {
+      return url is string &&
+        (url.matches("^https://.*") || url.matches("^http://.*"));
+    }
+
+    // Validate required fields exist in a map
+    function hasRequiredFields(data, fields) {
+      return data.keys().hasAll(fields);
+    }
+
+    // Validate map contains strictly allowed fields
+    function hasOnlyAllowedFields(data, fields) {
+      return data.keys().hasOnly(fields);
+    }
+
+    // ===============================================================
+    // Domain Validators: Users Collection
+    // ===============================================================
+
+    // Full domain validator for users collection schema and limits
+    function isValidUserProfile(data) {
+      return hasOnlyAllowedFields(data, [
+               'uid', 'displayName', 'email', 'photoURL',
+               'role', 'responderSubtype', 'commandLevel',
+               'requestedRole', 'requestedResponderSubtype',
+               'approvalStatus', 'phoneNumber', 'phoneVerified',
+               'emailVerified', 'accountStatus', 'createdAt',
+               'updatedAt', 'lastLoginAt'
+             ]) &&
+             hasRequiredFields(data, [
+               'uid', 'displayName', 'email',
+               'role', 'approvalStatus', 'phoneVerified',
+               'emailVerified', 'accountStatus', 'createdAt', 'updatedAt'
+             ]) &&
+             data.uid is string &&
+             data.uid.size() > 0 &&
+             data.uid.size() <= 128 &&
+             data.displayName is string &&
+             data.displayName.size() > 0 &&
+             data.displayName.size() <= 100 &&
+             data.email is string &&
+             data.email.size() > 0 &&
+             data.email.size() <= 254 &&
+             isValidEmail(data.email) &&
+             (!('photoURL' in data) || data.photoURL == null || (data.photoURL is string && data.photoURL.size() <= 2048 && isValidUrl(data.photoURL))) &&
+             data.role in ['CITIZEN', 'RESPONDER', 'COMMAND'] &&
+             (!('responderSubtype' in data) || data.responderSubtype == null || data.responderSubtype in ['PROFESSIONAL', 'VOLUNTEER']) &&
+             (!('commandLevel' in data) || data.commandLevel == null || data.commandLevel in ['COORDINATOR', 'ADMINISTRATOR']) &&
+             (!('requestedRole' in data) || data.requestedRole == null || data.requestedRole == 'RESPONDER') &&
+             (!('requestedResponderSubtype' in data) || data.requestedResponderSubtype == null || data.requestedResponderSubtype in ['PROFESSIONAL', 'VOLUNTEER']) &&
+             data.approvalStatus in ['NOT_REQUIRED', 'PENDING', 'APPROVED', 'REJECTED'] &&
+             (!('phoneNumber' in data) || data.phoneNumber == null || (data.phoneNumber is string && data.phoneNumber.size() <= 30)) &&
+             data.phoneVerified is bool &&
+             data.emailVerified is bool &&
+             data.accountStatus in ['ACTIVE', 'SUSPENDED'] &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp &&
+             (!('lastLoginAt' in data) || data.lastLoginAt == null || data.lastLoginAt is timestamp);
+    }
+
+    // Enforce hierarchical consistency between role, responderSubtype, and commandLevel
+    function hasValidRoleStructure(data) {
+      return (data.role == 'CITIZEN' && data.responderSubtype == null && data.commandLevel == null) ||
+             (data.role == 'RESPONDER' && data.commandLevel == null && (data.responderSubtype == null || data.responderSubtype in ['PROFESSIONAL', 'VOLUNTEER'])) ||
+             (data.role == 'COMMAND' && data.responderSubtype == null && data.commandLevel in ['COORDINATOR', 'ADMINISTRATOR']);
+    }
+
+    // Rules for user profile registration (create)
+    function isValidUserCreate(uid) {
+      let d = request.resource.data;
+      return isValidUserProfile(d) &&
+             hasValidRoleStructure(d) &&
+             // Authenticated identity verification
+             isAuthenticated() &&
+             request.auth.uid == uid &&
+             d.uid == uid &&
+             // Email integrity check against Firebase Auth token when present
+             (!('email' in request.auth.token) || request.auth.token.email == null || d.email == request.auth.token.email) &&
+             // Strict privilege lockdown on creation: user can ONLY self-register as CITIZEN
+             d.role == 'CITIZEN' &&
+             d.commandLevel == null &&
+             d.responderSubtype == null &&
+             // Responder application validation
+             ((d.requestedRole == 'RESPONDER' && d.approvalStatus == 'PENDING' && d.requestedResponderSubtype in ['PROFESSIONAL', 'VOLUNTEER']) ||
+              (d.requestedRole == null && d.approvalStatus == 'NOT_REQUIRED' && d.requestedResponderSubtype == null)) &&
+             // Initial status requirements
+             d.accountStatus == 'ACTIVE' &&
+             d.phoneVerified == false &&
+             // Timestamp bounds
+             d.createdAt <= request.time &&
+             d.updatedAt <= request.time;
+    }
+
+    // Rules for self-update of user profile
+    function isValidUserSelfUpdate(uid) {
+      let d = request.resource.data;
+      let prev = resource.data;
+      return isValidUserProfile(d) &&
+             hasValidRoleStructure(d) &&
+             // Suspended users cannot update anything
+             prev.accountStatus == 'ACTIVE' &&
+             // Immutable core identifiers
+             d.uid == uid &&
+             d.uid == prev.uid &&
+             d.createdAt == prev.createdAt &&
+             d.email == prev.email &&
+             // Self-escalation prevention: privilege fields CANNOT be modified by the user
+             d.role == prev.role &&
+             d.responderSubtype == prev.responderSubtype &&
+             d.commandLevel == prev.commandLevel &&
+             d.approvalStatus == prev.approvalStatus &&
+             d.accountStatus == prev.accountStatus &&
+             d.phoneVerified == prev.phoneVerified &&
+             d.requestedRole == prev.requestedRole &&
+             d.requestedResponderSubtype == prev.requestedResponderSubtype &&
+             // Diff restriction: only non-privileged profile fields may be edited
+             request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+               'displayName', 'phoneNumber', 'photoURL', 'updatedAt', 'lastLoginAt', 'emailVerified'
+             ]) &&
+             // emailVerified can only be toggled true if confirmed by Firebase Auth token
+             (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['emailVerified']) ||
+              d.emailVerified == prev.emailVerified ||
+              ('email_verified' in request.auth.token && request.auth.token.email_verified == true && d.emailVerified == true)) &&
+             // Timestamp update required
+             d.updatedAt is timestamp &&
+             d.updatedAt <= request.time;
+    }
+
+    // Rules for administrative update of user profile
+    function isValidUserAdminUpdate(uid) {
+      let d = request.resource.data;
+      let prev = resource.data;
+      return isAdministrator() &&
+             isValidUserProfile(d) &&
+             hasValidRoleStructure(d) &&
+             // Immutable document invariants
+             d.uid == prev.uid &&
+             d.createdAt == prev.createdAt &&
+             // Administrator cannot alter their own authority standing or lock themselves out
+             (request.auth.uid != uid || (
+               d.role == prev.role &&
+               d.commandLevel == prev.commandLevel &&
+               d.accountStatus == prev.accountStatus
+             )) &&
+             // Admin allowed modification fields
+             request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+               'role', 'responderSubtype', 'commandLevel', 'approvalStatus',
+               'accountStatus', 'updatedAt', 'displayName', 'phoneNumber', 'photoURL'
+             ]) &&
+             d.updatedAt is timestamp;
+    }
+
+    // ===============================================================
+    // Domain Validators: Incidents Collection
+    // ===============================================================
+
+    // Full domain validator for incidents collection
+    function isValidIncident(data) {
+      return hasOnlyAllowedFields(data, [
+               'id', 'type', 'place', 'description', 'status', 'priority',
+               'createdBy', 'creatorName', 'creatorPhone', 'assignedResponderId',
+               'notes', 'createdAt', 'updatedAt'
+             ]) &&
+             hasRequiredFields(data, [
+               'id', 'type', 'place', 'status', 'priority',
+               'createdBy', 'createdAt', 'updatedAt'
+             ]) &&
+             data.id is string && data.id.size() > 0 && data.id.size() <= 64 &&
+             data.type is string && data.type.size() > 0 && data.type.size() <= 50 &&
+             data.place is string && data.place.size() > 0 && data.place.size() <= 200 &&
+             (!('description' in data) || data.description == null || (data.description is string && data.description.size() <= 2000)) &&
+             data.status is string && data.status.size() > 0 && data.status.size() <= 50 &&
+             data.priority is string && data.priority.size() > 0 && data.priority.size() <= 30 &&
+             data.createdBy is string && data.createdBy.size() > 0 && data.createdBy.size() <= 128 &&
+             (!('creatorName' in data) || data.creatorName == null || (data.creatorName is string && data.creatorName.size() <= 100)) &&
+             (!('creatorPhone' in data) || data.creatorPhone == null || (data.creatorPhone is string && data.creatorPhone.size() <= 30)) &&
+             (!('assignedResponderId' in data) || data.assignedResponderId == null || (data.assignedResponderId is string && data.assignedResponderId.size() <= 128)) &&
+             (!('notes' in data) || data.notes == null || (data.notes is string && data.notes.size() <= 2000)) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    // Incident creation validation
+    function isValidIncidentCreate() {
+      let d = request.resource.data;
+      return isValidIncident(d) &&
+             // Author ownership validation
+             d.createdBy == request.auth.uid &&
+             d.createdAt <= request.time &&
+             d.updatedAt <= request.time;
+    }
+
+    // Incident update by Command staff
+    function isValidIncidentCommandUpdate() {
+      let d = request.resource.data;
+      let prev = resource.data;
+      return isCommand() &&
+             isValidIncident(d) &&
+             d.id == prev.id &&
+             d.createdBy == prev.createdBy &&
+             d.createdAt == prev.createdAt &&
+             d.updatedAt <= request.time;
+    }
+
+    // Incident update by Approved Responders (restricted to status, notes, assignment)
+    function isValidIncidentResponderUpdate() {
+      let d = request.resource.data;
+      let prev = resource.data;
+      return isApprovedResponder() &&
+             isValidIncident(d) &&
+             d.id == prev.id &&
+             d.createdBy == prev.createdBy &&
+             d.createdAt == prev.createdAt &&
+             // Responders can only modify status, notes, assigned responder, and updatedAt
+             request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+               'status', 'notes', 'assignedResponderId', 'updatedAt'
+             ]) &&
+             d.updatedAt <= request.time;
+    }
+
+    // Incident update by authoring Citizen (only while report is pending dispatch)
+    function isValidIncidentCitizenUpdate() {
+      let d = request.resource.data;
+      let prev = resource.data;
+      return isActiveUser() &&
+             prev.createdBy == request.auth.uid &&
+             d.createdBy == request.auth.uid &&
+             d.id == prev.id &&
+             d.createdAt == prev.createdAt &&
+             // Citizens can only modify pending reports
+             prev.status in ['Pending', 'pending', 'Waiting for connection', 'Saved on device'] &&
+             request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+               'description', 'place', 'type', 'priority', 'status', 'updatedAt'
+             ]) &&
+             d.status in ['Pending', 'pending', 'Waiting for connection', 'Saved on device', 'Cancelled', 'cancelled'] &&
+             isValidIncident(d) &&
+             d.updatedAt <= request.time;
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // User Profile Documents
+    match /users/{uid} {
+      // Read: A user can read their own profile; active Command users (COORDINATOR and ADMINISTRATOR)
+      // can inspect profiles for operations and coordination.
+      allow read: if isOwner(uid) || isCommandUser();
+
+      // Create: Users can register their own profile with CITIZEN role only.
+      allow create: if isValidUserCreate(uid);
+
+      // Update: Self-update for non-privileged fields; Admin-update for role, status, and assignment.
+      allow update: if (isOwner(uid) && isValidUserSelfUpdate(uid)) ||
+                       isValidUserAdminUpdate(uid);
+
+      // Delete: Only active Administrators can delete user profiles.
+      allow delete: if isAdministrator();
+    }
+
+    // Incidents Collection
+    match /incidents/{incidentId} {
+      // Read: Authenticated users in ACTIVE standing
+      allow read: if isActiveUser();
+
+      // Create: Authenticated active citizens, responders, and command
+      allow create: if isActiveUser() && isValidIncidentCreate();
+
+      // Update:
+      // - Active Command users can update any incident field
+      // - Approved Responders can update status, notes, and assignment
+      // - Citizens can only update their own pending incident report
+      allow update: if isValidIncidentCommandUpdate() ||
+                       isValidIncidentResponderUpdate() ||
+                       isValidIncidentCitizenUpdate();
+
+      // Delete: Only active Command staff can delete incident records
+      allow delete: if isCommand();
+    }
+
+    // Reports Collection (Citizen emergency reports alias)
+    match /reports/{reportId} {
+      allow read: if isActiveUser();
+      allow create: if isActiveUser() && isValidIncidentCreate();
+      allow update: if isValidIncidentCommandUpdate() ||
+                       isValidIncidentResponderUpdate() ||
+                       isValidIncidentCitizenUpdate();
+      allow delete: if isCommand();
+    }
+
+    // ===============================================================
+    // Default Deny Rule
+    // ===============================================================
+    // Explicitly deny read and write access to all other paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

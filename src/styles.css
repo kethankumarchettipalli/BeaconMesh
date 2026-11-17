@@ -1,0 +1,798 @@
+@import "tailwindcss" source(none);
+@source "../src";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-display: "Manrope", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-signal: var(--signal);
+  --color-urgent: var(--urgent);
+  --color-safe: var(--safe);
+  --color-ink: var(--ink);
+}
+
+:root {
+  --radius: 0.375rem;
+  --background: oklch(0.985 0.008 90);
+  --foreground: oklch(0.2 0.025 245);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.2 0.025 245);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.2 0.025 245);
+  --primary: oklch(0.64 0.17 50);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.94 0.015 220);
+  --secondary-foreground: oklch(0.27 0.045 240);
+  --muted: oklch(0.96 0.012 220);
+  --muted-foreground: oklch(0.48 0.025 240);
+  --accent: oklch(0.93 0.035 200);
+  --accent-foreground: oklch(0.22 0.035 235);
+  --destructive: oklch(0.57 0.2 28);
+  --destructive-foreground: oklch(0.99 0 0);
+  --border: oklch(0.88 0.015 230);
+  --input: oklch(0.88 0.015 230);
+  --ring: oklch(0.65 0.13 205);
+  --signal: oklch(0.72 0.13 205);
+  --urgent: oklch(0.58 0.21 28);
+  --safe: oklch(0.56 0.13 153);
+  --ink: oklch(0.16 0.035 246);
+}
+
+.dark {
+  --background: oklch(0.16 0.025 246);
+  --foreground: oklch(0.96 0.01 90);
+  --card: oklch(0.2 0.03 246);
+  --card-foreground: oklch(0.96 0.01 90);
+  --popover: oklch(0.2 0.03 246);
+  --popover-foreground: oklch(0.96 0.01 90);
+  --primary: oklch(0.72 0.16 50);
+  --primary-foreground: oklch(0.16 0.025 246);
+  --secondary: oklch(0.27 0.035 240);
+  --secondary-foreground: oklch(0.94 0.01 90);
+  --muted: oklch(0.23 0.03 244);
+  --muted-foreground: oklch(0.73 0.025 225);
+  --accent: oklch(0.29 0.055 205);
+  --accent-foreground: oklch(0.96 0.01 90);
+  --destructive: oklch(0.65 0.19 28);
+  --destructive-foreground: oklch(0.98 0.01 90);
+  --border: oklch(0.34 0.03 240);
+  --input: oklch(0.34 0.03 240);
+  --ring: oklch(0.68 0.13 205);
+  --signal: oklch(0.76 0.13 205);
+  --urgent: oklch(0.71 0.17 28);
+  --safe: oklch(0.72 0.13 153);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+  html {
+    scroll-behavior: smooth;
+  }
+  body {
+    background: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+  }
+  button,
+  a,
+  input,
+  select,
+  textarea {
+    -webkit-tap-highlight-color: transparent;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+}
+
+.section-kicker {
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--color-signal);
+}
+.landing-hero {
+  isolation: isolate;
+}
+.hero-shade {
+  background:
+    linear-gradient(
+      90deg,
+      oklch(0.13 0.035 245 / 0.94) 0%,
+      oklch(0.13 0.035 245 / 0.76) 45%,
+      oklch(0.13 0.035 245 / 0.12) 100%
+    ),
+    linear-gradient(0deg, oklch(0.13 0.035 245 / 0.6), transparent 48%);
+}
+
+/* ========================================================= */
+/* === CINEMATIC EMERGENCY NETWORK HERO ANIMATIONS ========= */
+/* ========================================================= */
+
+/* STAGE 1: Cinematic camera depth drift on background image */
+@keyframes cinematic-drift {
+  0% {
+    transform: scale(1) translate3d(0, 0, 0);
+  }
+  50% {
+    transform: scale(1.025) translate3d(-0.6%, -0.35%, 0);
+  }
+  100% {
+    transform: scale(1) translate3d(0, 0, 0);
+  }
+}
+
+.hero-cinematic-img {
+  animation: cinematic-drift 24s ease-in-out infinite;
+  transform-origin: 68% 50%;
+  will-change: transform;
+}
+
+/* Ambient storm atmospheric mist layer */
+@keyframes atmospheric-breathe {
+  0%, 100% {
+    opacity: 0.18;
+  }
+  50% {
+    opacity: 0.38;
+  }
+}
+
+.hero-atmospheric-mist {
+  background: radial-gradient(
+    ellipse 65% 55% at 65% 45%,
+    oklch(0.72 0.13 205 / 0.09) 0%,
+    oklch(0.16 0.035 246 / 0.04) 50%,
+    transparent 80%
+  );
+  animation: atmospheric-breathe 12s ease-in-out infinite alternate;
+  mix-blend-mode: screen;
+}
+
+/* STAGE 2: Responder directional radio search waves */
+@keyframes radio-pulse-1 {
+  0%, 15.9% {
+    opacity: 0;
+    transform: scale(0.3);
+  }
+  16.5% {
+    opacity: 0.85;
+    transform: scale(0.4);
+  }
+  25% {
+    opacity: 0;
+    transform: scale(4.8);
+  }
+  25.1%, 100% {
+    opacity: 0;
+    transform: scale(0.3);
+  }
+}
+
+@keyframes radio-pulse-2 {
+  0%, 20.9% {
+    opacity: 0;
+    transform: scale(0.3);
+  }
+  21.5% {
+    opacity: 0.85;
+    transform: scale(0.4);
+  }
+  30% {
+    opacity: 0;
+    transform: scale(5.8);
+  }
+  30.1%, 100% {
+    opacity: 0;
+    transform: scale(0.3);
+  }
+}
+
+@keyframes radio-pulse-3 {
+  0%, 25.9% {
+    opacity: 0;
+    transform: scale(0.3);
+  }
+  26.5% {
+    opacity: 0.85;
+    transform: scale(0.4);
+  }
+  35% {
+    opacity: 0;
+    transform: scale(6.8);
+  }
+  35.1%, 100% {
+    opacity: 0;
+    transform: scale(0.3);
+  }
+}
+
+.radio-wave {
+  fill: none;
+  stroke: oklch(0.74 0.14 205);
+  stroke-width: 1.2;
+  transform-origin: 812px 262px;
+}
+
+.radio-wave-1 {
+  animation: radio-pulse-1 24s cubic-bezier(0.2, 0.8, 0.4, 1) infinite;
+}
+
+.radio-wave-2 {
+  animation: radio-pulse-2 24s cubic-bezier(0.2, 0.8, 0.4, 1) infinite;
+}
+
+.radio-wave-3 {
+  animation: radio-pulse-3 24s cubic-bezier(0.2, 0.8, 0.4, 1) infinite;
+}
+
+/* Node item shared styles */
+.hero-node-item {
+  transition: opacity 0.4s ease;
+}
+
+/* Responder Node (Source) */
+@keyframes node-source-glow {
+  0%, 15% {
+    opacity: 0.25;
+  }
+  17%, 88% {
+    opacity: 1;
+  }
+  98%, 100% {
+    opacity: 0.25;
+  }
+}
+
+.node-source {
+  animation: node-source-glow 24s ease-in-out infinite;
+}
+
+/* STAGE 3: Terrain Nodes (Ridge & Slope) */
+@keyframes node-stage-3-pulse {
+  0%, 35% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  36% {
+    opacity: 1;
+    transform: scale(1.2);
+  }
+  39%, 88% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  98%, 100% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+}
+
+.node-stage-3 {
+  transform-origin: 732px 342px;
+  animation: node-stage-3-pulse 24s ease-in-out infinite;
+}
+
+@keyframes node-stage-3-delayed-pulse {
+  0%, 43% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  44% {
+    opacity: 1;
+    transform: scale(1.2);
+  }
+  47%, 88% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  98%, 100% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+}
+
+.node-stage-3-delayed {
+  transform-origin: 652px 388px;
+  animation: node-stage-3-delayed-pulse 24s ease-in-out infinite;
+}
+
+/* STAGE 4: Distant Horizon Beacon (Warm Amber / Orange) */
+@keyframes beacon-activation {
+  0%, 51.5% {
+    opacity: 0.2;
+    transform: scale(0.8);
+  }
+  52.5% {
+    opacity: 1;
+    transform: scale(1.35);
+  }
+  55%, 88% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  98%, 100% {
+    opacity: 0.2;
+    transform: scale(0.8);
+  }
+}
+
+.node-beacon-horizon {
+  transform-origin: 574px 308px;
+  animation: beacon-activation 24s cubic-bezier(0.2, 0.9, 0.3, 1) infinite;
+}
+
+/* Warm Amber Beacon Waves */
+@keyframes beacon-wave-pulse-1 {
+  0%, 53.5% {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+  54.5% {
+    opacity: 0.9;
+    transform: scale(0.6);
+  }
+  64% {
+    opacity: 0;
+    transform: scale(5.5);
+  }
+  64.1%, 100% {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+}
+
+@keyframes beacon-wave-pulse-2 {
+  0%, 59% {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+  60% {
+    opacity: 0.9;
+    transform: scale(0.6);
+  }
+  69% {
+    opacity: 0;
+    transform: scale(6.2);
+  }
+  69.1%, 100% {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+}
+
+.beacon-wave {
+  fill: none;
+  stroke: oklch(0.68 0.18 45);
+  stroke-width: 1.4;
+  transform-origin: 574px 308px;
+}
+
+.beacon-wave-1 {
+  animation: beacon-wave-pulse-1 24s cubic-bezier(0.2, 0.8, 0.4, 1) infinite;
+}
+
+.beacon-wave-2 {
+  animation: beacon-wave-pulse-2 24s cubic-bezier(0.2, 0.8, 0.4, 1) infinite;
+}
+
+/* Stage 4 Node: Coastal Overlook */
+@keyframes node-stage-4-pulse {
+  0%, 63% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  64% {
+    opacity: 1;
+    transform: scale(1.2);
+  }
+  67%, 88% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  98%, 100% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+}
+
+.node-stage-4 {
+  transform-origin: 486px 332px;
+  animation: node-stage-4-pulse 24s ease-in-out infinite;
+}
+
+/* STAGE 5: Community and Perimeter Nodes */
+@keyframes node-stage-5-pulse {
+  0%, 72% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  73% {
+    opacity: 1;
+    transform: scale(1.2);
+  }
+  76%, 88% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  98%, 100% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+}
+
+.node-stage-5 {
+  animation: node-stage-5-pulse 24s ease-in-out infinite;
+}
+
+/* Network Path Drawing Animations */
+@keyframes path-stage-3-draw {
+  0%, 31% {
+    stroke-dashoffset: 120;
+    opacity: 0;
+  }
+  32% {
+    opacity: 0.9;
+  }
+  40%, 88% {
+    stroke-dashoffset: 0;
+    opacity: 0.9;
+  }
+  98%, 100% {
+    stroke-dashoffset: 0;
+    opacity: 0;
+  }
+}
+
+.mesh-path-draw.stage-3 {
+  animation: path-stage-3-draw 24s ease-in-out infinite;
+}
+
+@keyframes path-stage-4-draw {
+  0%, 46% {
+    stroke-dashoffset: 120;
+    opacity: 0;
+  }
+  47% {
+    opacity: 0.9;
+  }
+  55%, 88% {
+    stroke-dashoffset: 0;
+    opacity: 0.9;
+  }
+  98%, 100% {
+    stroke-dashoffset: 0;
+    opacity: 0;
+  }
+}
+
+.mesh-path-draw.stage-4 {
+  animation: path-stage-4-draw 24s ease-in-out infinite;
+}
+
+@keyframes path-stage-5-draw {
+  0%, 65% {
+    stroke-dashoffset: 240;
+    opacity: 0;
+  }
+  66% {
+    opacity: 0.8;
+  }
+  76%, 88% {
+    stroke-dashoffset: 0;
+    opacity: 0.8;
+  }
+  98%, 100% {
+    stroke-dashoffset: 0;
+    opacity: 0;
+  }
+}
+
+.mesh-path-draw.stage-5 {
+  animation: path-stage-5-draw 24s ease-in-out infinite;
+}
+
+/* Travelling signal packet pulses along lines */
+@keyframes packet-travel {
+  0% {
+    stroke-dashoffset: 260;
+  }
+  100% {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes packet-stage-3-gate {
+  0%, 32% {
+    opacity: 0;
+  }
+  34%, 88% {
+    opacity: 1;
+  }
+  96%, 100% {
+    opacity: 0;
+  }
+}
+
+@keyframes packet-stage-4-gate {
+  0%, 48% {
+    opacity: 0;
+  }
+  50%, 88% {
+    opacity: 1;
+  }
+  96%, 100% {
+    opacity: 0;
+  }
+}
+
+@keyframes packet-stage-5-gate {
+  0%, 67% {
+    opacity: 0;
+  }
+  69%, 88% {
+    opacity: 1;
+  }
+  96%, 100% {
+    opacity: 0;
+  }
+}
+
+.mesh-signal-packet {
+  animation: packet-travel 1.8s linear infinite;
+}
+
+.mesh-signal-packet.stage-3 {
+  animation:
+    packet-travel 1.8s linear infinite,
+    packet-stage-3-gate 24s ease-in-out infinite;
+}
+
+.mesh-signal-packet.stage-4 {
+  animation:
+    packet-travel 1.8s linear infinite,
+    packet-stage-4-gate 24s ease-in-out infinite;
+}
+
+.mesh-signal-packet.stage-5 {
+  animation:
+    packet-travel 2.2s linear infinite,
+    packet-stage-5-gate 24s ease-in-out infinite;
+}
+
+/* Reduced motion support */
+@media (prefers-reduced-motion: reduce) {
+  .hero-cinematic-img {
+    animation: none !important;
+    transform: none !important;
+  }
+  .hero-atmospheric-mist {
+    animation: none !important;
+    opacity: 0.22 !important;
+  }
+  .radio-wave,
+  .beacon-wave,
+  .mesh-signal-packet {
+    display: none !important;
+  }
+  .mesh-path-draw {
+    stroke-dashoffset: 0 !important;
+    opacity: 0.65 !important;
+    animation: none !important;
+  }
+  .hero-node-item {
+    opacity: 0.85 !important;
+    transform: none !important;
+    animation: none !important;
+  }
+  .node-halo,
+  .beacon-halo {
+    opacity: 0.6 !important;
+  }
+}
+
+/* Legacy fallback support */
+.hero-network {
+  opacity: 0.65;
+  pointer-events: none;
+}
+.hero-network span {
+  position: absolute;
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--color-signal);
+  box-shadow: 0 0 1rem var(--color-signal);
+  animation: signal-pulse 3s ease-in-out infinite;
+}
+.hero-network span:nth-child(1) {
+  left: 8%;
+  bottom: 22%;
+}
+.hero-network span:nth-child(2) {
+  left: 28%;
+  bottom: 31%;
+  animation-delay: 0.5s;
+}
+.hero-network span:nth-child(3) {
+  left: 47%;
+  bottom: 18%;
+  animation-delay: 1s;
+}
+.hero-network span:nth-child(4) {
+  right: 25%;
+  bottom: 32%;
+  animation-delay: 1.5s;
+}
+.hero-network span:nth-child(5) {
+  right: 7%;
+  bottom: 20%;
+  animation-delay: 2s;
+}
+.map-surface {
+  background-color: color-mix(in oklab, var(--color-muted) 74%, var(--color-background));
+}
+.map-grid,
+.simulation-grid {
+  background-image:
+    linear-gradient(
+      35deg,
+      transparent 47%,
+      color-mix(in oklab, var(--color-signal) 19%, transparent) 48%,
+      transparent 49%
+    ),
+    linear-gradient(
+      145deg,
+      transparent 53%,
+      color-mix(in oklab, var(--color-safe) 17%, transparent) 54%,
+      transparent 55%
+    ),
+    linear-gradient(color-mix(in oklab, var(--color-border) 62%, transparent) 1px, transparent 1px),
+    linear-gradient(
+      90deg,
+      color-mix(in oklab, var(--color-border) 62%, transparent) 1px,
+      transparent 1px
+    );
+  background-size:
+    auto,
+    auto,
+    32px 32px,
+    32px 32px;
+  opacity: 0.8;
+}
+.map-route {
+  border: 1px dashed color-mix(in oklab, var(--color-signal) 55%, transparent);
+  clip-path: polygon(12% 12%, 73% 0, 93% 38%, 76% 84%, 37% 100%, 3% 72%);
+}
+.map-pin {
+  position: absolute;
+  display: grid;
+  width: 2rem;
+  height: 2rem;
+  place-items: center;
+  border: 2px solid var(--color-background);
+  border-radius: 50%;
+  background: var(--color-urgent);
+  color: white;
+  box-shadow: 0 2px 10px oklch(0 0 0 / 0.2);
+}
+.map-pin svg {
+  width: 1rem;
+  height: 1rem;
+}
+.pin-a {
+  left: 18%;
+  top: 16%;
+}
+.pin-b {
+  left: 53%;
+  top: 47%;
+  background: var(--color-signal);
+}
+.pin-c {
+  right: 13%;
+  bottom: 9%;
+  background: var(--color-safe);
+}
+.pin-d {
+  right: 24%;
+  top: 19%;
+  background: var(--color-signal);
+}
+.simulation-board {
+  background: color-mix(in oklab, var(--color-muted) 66%, var(--color-background));
+}
+.simulation-grid {
+  opacity: 0.65;
+}
+.node {
+  position: absolute;
+  z-index: 2;
+  display: grid;
+  justify-items: center;
+  gap: 0.3rem;
+  transform: translate(-50%, -50%);
+}
+.node-dot {
+  display: grid;
+  width: 2.7rem;
+  height: 2.7rem;
+  place-items: center;
+  border: 1px solid var(--color-signal);
+  border-radius: 50%;
+  background: var(--color-background);
+  color: var(--color-signal);
+  box-shadow: 0 0 0 5px color-mix(in oklab, var(--color-signal) 12%, transparent);
+}
+.node-dot svg {
+  width: 1.1rem;
+  height: 1.1rem;
+}
+.node-active .node-dot {
+  animation: signal-pulse 1.3s infinite;
+}
+.node-label {
+  border: 1px solid var(--color-border);
+  background: var(--color-background);
+  padding: 0.2rem 0.45rem;
+  font-size: 0.65rem;
+  font-weight: 600;
+}
+.network-line {
+  fill: none;
+  stroke: var(--color-signal);
+  stroke-width: 2;
+  stroke-dasharray: 5 7;
+  opacity: 0.55;
+}
+.auth-visual {
+  background: var(--color-ink);
+}
+@keyframes signal-pulse {
+  0%,
+  100% {
+    opacity: 0.65;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.12);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
