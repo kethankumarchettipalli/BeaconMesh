@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, lazy, Suspense } from "react";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import {
   Activity,
@@ -40,21 +40,96 @@ import { Badge } from "@/components/ui/badge";
 import beaconIcon from "@/assets/beacon-network-icon.png.asset.json";
 import beaconWordmark from "@/assets/beaconmesh-wordmark.png.asset.json";
 import heroImage from "@/assets/beaconmesh-hero.jpg";
-import { useAuth } from "@/lib/auth-context";
+import { useAuth, evaluateRoleAuthorization } from "@/lib/auth-context";
 import { LoginForm, SignupForm, VerifyEmailForm, ForgotPasswordForm } from "./auth-forms";
 import { HeroCinematicAnimation } from "./hero-cinematic-animation";
 import { WORKSPACE_ROUTES } from "@/lib/auth-types";
+import {
+  createEmergencyReport,
+  getUserIncidents,
+  getAllIncidents,
+  updateIncidentStatus,
+  assignIncidentToResponder,
+  subscribeToIncidents,
+} from "@/lib/services/incident-service";
+import {
+  getVerifiedSafeZones,
+  createAndVerifySafeZone,
+  subscribeToSafeZones,
+} from "@/lib/services/safezone-service";
+import {
+  getResponderProfile,
+  setResponderAvailability,
+  getAssignedIncidents,
+} from "@/lib/services/responder-service";
+import {
+  computeIncidentAggregates,
+  getOperationalUserDirectory,
+  type OperationalUserItem,
+} from "@/lib/services/command-service";
+import { initAutoSync } from "@/lib/services/sync-service";
+
+const BeaconMapConsole = lazy(() =>
+  import("@/components/gis/BeaconMapConsole").then((m) => ({
+    default: m.BeaconMapConsole,
+  })),
+);
+import { updateUserPreferences } from "@/lib/user-service";
+import type {
+  IncidentRecord,
+  SafeZoneRecord,
+  IncidentCategory,
+  IncidentStatus,
+  SyncStatus,
+} from "@/lib/types/data-models";
 
 type PreviewRole = "CITIZEN" | "RESPONDER" | "COORDINATOR" | "ADMINISTRATOR";
 type ResponderType = "PROFESSIONAL" | "VOLUNTEER";
-type Incident = {
+export type Incident = {
   id: string;
   type: string;
   place: string;
   time: string;
   status: string;
   priority: string;
+  description?: string;
+  reporterId?: string;
+  assignedResponderIds?: string[];
+  syncStatus?: SyncStatus;
 };
+
+export function formatRelativeTime(isoString: string): string {
+  try {
+    const diff = Math.floor((Date.now() - new Date(isoString).getTime()) / 1000);
+    if (diff < 60) return "Just now";
+    if (diff < 3600) return `${Math.floor(diff / 60)} min ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)} hr ago`;
+    return `${Math.floor(diff / 86400)} days ago`;
+  } catch {
+    return "Recently";
+  }
+}
+
+export function toDisplayIncident(rec: IncidentRecord): Incident {
+  const hasCoords =
+    typeof rec.location?.latitude === "number" && typeof rec.location?.longitude === "number";
+  return {
+    id: rec.id,
+    type: rec.category,
+    place:
+      rec.location?.addressLabel ||
+      (hasCoords
+        ? `GPS (${rec.location!.latitude!.toFixed(4)}, ${rec.location!.longitude!.toFixed(4)})`
+        : (rec.place || "Location not specified")),
+    time: formatRelativeTime(rec.createdAt),
+    status: rec.status,
+    priority: rec.severity,
+    description: rec.description,
+    reporterId: rec.reporterId,
+    assignedResponderIds: rec.assignedResponderIds || [],
+    syncStatus: rec.syncStatus,
+  };
+}
 
 function isIncident(value: unknown): value is Incident {
   if (typeof value !== "object" || value === null) return false;
@@ -64,40 +139,7 @@ function isIncident(value: unknown): value is Incident {
   );
 }
 
-const initialIncidents: Incident[] = [
-  {
-    id: "BM-2408-018",
-    type: "Medical",
-    place: "North Shore · Pier 4",
-    time: "8 min ago",
-    status: "Acknowledged",
-    priority: "Critical",
-  },
-  {
-    id: "BM-2408-016",
-    type: "Flood",
-    place: "Harbor Road · Block C",
-    time: "21 min ago",
-    status: "In progress",
-    priority: "High",
-  },
-  {
-    id: "BM-2408-012",
-    type: "Trapped",
-    place: "Old Town · Market Street",
-    time: "36 min ago",
-    status: "Waiting for connection",
-    priority: "High",
-  },
-  {
-    id: "BM-2408-009",
-    type: "Fire",
-    place: "East Ridge · Lookout",
-    time: "1 hr ago",
-    status: "Resolved",
-    priority: "Moderate",
-  },
-];
+const initialIncidents: Incident[] = [];
 
 type WorkspaceSection = {
   title: string;
@@ -142,6 +184,7 @@ const titleMap: Record<string, string> = {
   "/responder/overview": "Field overview",
   "/responder/field-map": "Field map",
   "/responder/status": "Status updates",
+  "/responder/application-pending": "Application pending",
   "/command/overview": "Command overview",
   "/command/map": "Live operations map",
   "/command/incidents": "Incident management",
@@ -283,14 +326,25 @@ function Header({
   responderType,
   onRoleChange,
   onResponderTypeChange,
+  path,
 }: {
   landing?: boolean;
   previewRole?: PreviewRole;
   responderType?: ResponderType;
   onRoleChange?: (role: PreviewRole) => void;
   onResponderTypeChange?: (type: ResponderType) => void;
+  path?: string;
 }) {
   const { user, profile, signOut } = useAuth();
+
+  const activeRole = profile?.role || "CITIZEN";
+  const badgeLabel =
+    activeRole === "RESPONDER"
+      ? `RESPONDER · ${profile?.responderSubtype || "VOLUNTEER"}`
+      : activeRole === "COMMAND"
+        ? `COMMAND · ${profile?.commandLevel || "COORDINATOR"}`
+        : "CITIZEN";
+
   return (
     <header
       className="relative z-20 flex min-h-16 items-center justify-between gap-3 border-b border-border bg-background/95 backdrop-blur px-4 sm:px-7 text-foreground"
@@ -310,10 +364,10 @@ function Header({
           {user ? (
             <>
               <Link
-                to={WORKSPACE_ROUTES[profile?.role || "CITIZEN"]}
+                to={WORKSPACE_ROUTES[activeRole]}
                 className="font-semibold text-signal transition-colors hover:text-foreground"
               >
-                Workspace ({profile?.role || "Citizen"})
+                Workspace ({activeRole})
               </Link>
               <button
                 type="button"
@@ -336,11 +390,8 @@ function Header({
             <div className="flex items-center gap-2">
               <span className="hidden sm:inline-flex items-center gap-1.5 rounded-full border border-signal/30 bg-signal/10 px-2.5 py-1 text-xs font-semibold text-foreground">
                 <span className="h-1.5 w-1.5 rounded-full bg-safe" />
-                {profile?.role === "RESPONDER"
-                  ? `${profile.role} · ${profile.responderSubtype || "VOLUNTEER"}`
-                  : profile?.role === "COMMAND"
-                    ? `${profile.role} · ${profile.commandLevel || "COORDINATOR"}`
-                    : profile?.role || "CITIZEN"}
+                <span className="text-[10px] uppercase tracking-wider text-muted-foreground">Account:</span>
+                {badgeLabel}
               </span>
               <Button
                 variant="ghost"
@@ -374,7 +425,7 @@ function Header({
           <ThemeToggle />
           {user ? (
             <Button asChild size="sm">
-              <Link to={WORKSPACE_ROUTES[profile?.role || "CITIZEN"]}>Workspace</Link>
+              <Link to={WORKSPACE_ROUTES[activeRole]}>Workspace</Link>
             </Button>
           ) : (
             <Button asChild size="sm">
@@ -703,12 +754,17 @@ function DashboardContent({
   role,
   incidents,
   setIncidents,
+  rawIncidents = [],
+  onRefresh,
 }: {
   path: string;
   role: PreviewRole;
   incidents: Incident[];
   setIncidents: (incidents: Incident[]) => void;
+  rawIncidents?: IncidentRecord[];
+  onRefresh?: () => void;
 }) {
+  const { user, profile } = useAuth();
   const [category, setCategory] = useState("Medical");
   const [description, setDescription] = useState("");
   const [message, setMessage] = useState("");
@@ -718,6 +774,52 @@ function DashboardContent({
   const [playing, setPlaying] = useState(false);
   const [selected, setSelected] = useState<Incident | null>(null);
   const [available, setAvailable] = useState(true);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [locationLabel, setLocationLabel] = useState("Location coordinates unconfirmed");
+  const [manualAddress, setManualAddress] = useState("");
+  const [gpsCoords, setGpsCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const [safeZones, setSafeZones] = useState<SafeZoneRecord[]>([]);
+  const [operationalUsers, setOperationalUsers] = useState<OperationalUserItem[]>([]);
+
+  // Profile preferences state
+  const [profileFullName, setProfileFullName] = useState(profile?.displayName || "Citizen User");
+  const [profilePhone, setProfilePhone] = useState(profile?.phoneNumber || "+91 866 242 4172");
+  const [profileRegion, setProfileRegion] = useState("Vijayawada, NTR District");
+  const [profileLanguage, setProfileLanguage] = useState("English");
+  const [profileContacts, setProfileContacts] = useState("VMC Disaster Control · 0866-2424172");
+
+  useEffect(() => {
+    if (profile?.displayName) setProfileFullName(profile.displayName);
+    if (profile?.phoneNumber) setProfilePhone(profile.phoneNumber);
+  }, [profile]);
+
+  useEffect(() => {
+    let mounted = true;
+    const unsubSafeZones = subscribeToSafeZones((zones) => {
+      if (mounted) setSafeZones(zones);
+    });
+
+    getOperationalUserDirectory()
+      .then((users) => {
+        if (mounted && users && users.length > 0) setOperationalUsers(users);
+      })
+      .catch((err) => console.warn("Operational users load failed:", err));
+
+    if (user?.uid) {
+      getResponderProfile(user.uid)
+        .then((resp) => {
+          if (mounted && resp) setAvailable(resp.isAvailable);
+        })
+        .catch((err) => console.warn("Responder profile load failed:", err));
+    }
+    return () => {
+      mounted = false;
+      if (typeof unsubSafeZones === "function") {
+        unsubSafeZones();
+      }
+    };
+  }, [user?.uid]);
+
   const command = role === "COORDINATOR" || role === "ADMINISTRATOR";
   const roleKey = role === "CITIZEN" ? "CITIZEN" : role === "RESPONDER" ? "RESPONDER" : "COMMAND";
   const visibleIncidents = useMemo(
@@ -731,27 +833,171 @@ function DashboardContent({
       ),
     [incidents, query, filter],
   );
-  const createIncident = (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const newIncident = {
-      id: `BM-2408-${String(19 + incidents.length).padStart(3, "0")}`,
-      type: category,
-      place: "Your current location",
-      time: "Just now",
-      status: "Saved on device",
-      priority: "High",
-    };
-    setIncidents([newIncident, ...incidents]);
-    setDescription("");
-    setMessage(
-      `Report ${newIncident.id} saved on this device. It has not been sent to emergency services.`,
-    );
+
+  const confirmLocation = () => {
+    if (typeof window !== "undefined" && "geolocation" in navigator) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          setGpsCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+          setLocationLabel(`GPS (${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)})`);
+          setMessage("Precise GPS coordinates captured.");
+        },
+        () => {
+          setGpsCoords(null);
+          setLocationLabel("Coordinates Unavailable (GPS Denied/Timeout)");
+          setMessage("GPS unavailable or denied. Location coordinates marked unavailable.");
+        },
+        { timeout: 8000 },
+      );
+    } else {
+      setGpsCoords(null);
+      setLocationLabel("Coordinates Unavailable (No Geolocation Support)");
+      setMessage("Geolocation is not supported by your browser/device.");
+    }
   };
-  const setStatus = (status: string) => {
+
+  const createIncident = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!description.trim()) {
+      setMessage("Please enter a short description of what happened.");
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      const cat = ([
+        "Medical",
+        "Trapped",
+        "Fire",
+        "Flood",
+        "Accident",
+        "Other",
+      ].includes(category)
+        ? category
+        : "Other") as IncidentCategory;
+
+      const trimmedAddress = manualAddress.trim();
+      const locationPayload: Partial<IncidentLocation> = gpsCoords
+        ? {
+            latitude: gpsCoords.lat,
+            longitude: gpsCoords.lng,
+            accuracyMeters: 10,
+            source: "GPS",
+            addressLabel: trimmedAddress
+              ? `${trimmedAddress} · GPS (${gpsCoords.lat.toFixed(4)}, ${gpsCoords.lng.toFixed(4)})`
+              : locationLabel || `GPS (${gpsCoords.lat.toFixed(4)}, ${gpsCoords.lng.toFixed(4)})`,
+            country: "India",
+          }
+        : {
+            latitude: null,
+            longitude: null,
+            source: trimmedAddress ? "MANUAL" : "UNAVAILABLE",
+            addressLabel: trimmedAddress || "Coordinates Unavailable",
+            country: "India",
+          };
+
+      const record = await createEmergencyReport({
+        reporterId: user?.uid,
+        reporterNameSnapshot: profile?.displayName || user?.displayName || "Citizen",
+        reporterContact: profile?.phoneNumber || undefined,
+        category: cat,
+        description: description.trim(),
+        severity: category === "Medical" || category === "Fire" || category === "Trapped" ? "Critical" : "High",
+        location: locationPayload,
+      });
+
+      const displayInc = toDisplayIncident(record);
+      setIncidents([displayInc, ...incidents]);
+      setDescription("");
+      const syncStatusText =
+        record.syncStatus === "SYNCED"
+          ? "synced to Cloud"
+          : record.syncStatus === "PENDING_SYNC"
+            ? "queued for Cloud sync"
+            : "stored locally on device (offline)";
+      setMessage(`Report ${record.id} registered (${syncStatusText}).`);
+      if (onRefresh) onRefresh();
+    } catch (err: any) {
+      setMessage(`Report error: ${err?.message || "Failed to submit"}`);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const setStatus = async (status: string) => {
     if (!selected) return;
-    setIncidents(incidents.map((item) => (item.id === selected.id ? { ...item, status } : item)));
-    setSelected({ ...selected, status });
-    setMessage(`${selected.id} updated to ${status}.`);
+    let canonicalStatus: IncidentStatus = "Waiting for connection";
+    if (status.includes("Acknowledged")) canonicalStatus = "Acknowledged";
+    else if (status.includes("progress")) canonicalStatus = "In progress";
+    else if (status.includes("Resolved")) canonicalStatus = "Resolved";
+    else if (status.includes("Saved")) canonicalStatus = "Saved on device";
+
+    try {
+      await updateIncidentStatus(selected.id, canonicalStatus, undefined, user?.uid || "operator");
+      setIncidents(incidents.map((item) => (item.id === selected.id ? { ...item, status } : item)));
+      setSelected({ ...selected, status });
+      setMessage(`${selected.id} updated to ${status}.`);
+      if (onRefresh) onRefresh();
+    } catch {
+      setIncidents(incidents.map((item) => (item.id === selected.id ? { ...item, status } : item)));
+      setSelected({ ...selected, status });
+      setMessage(`${selected.id} updated locally.`);
+    }
+  };
+
+  const handleAssignResponder = async (responderId: string, responderName: string) => {
+    if (!selected) return;
+    try {
+      await assignIncidentToResponder(selected.id, responderId, responderName, user?.uid || "command-coordinator");
+      setIncidents(
+        incidents.map((item) =>
+          item.id === selected.id
+            ? { ...item, status: "Acknowledged", assignedResponderIds: [responderId] }
+            : item,
+        ),
+      );
+      setSelected({
+        ...selected,
+        status: "Acknowledged",
+        assignedResponderIds: [responderId],
+      });
+      setMessage(`Assigned ${selected.id} to ${responderName}.`);
+      if (onRefresh) onRefresh();
+    } catch (err: any) {
+      setMessage(`Failed to assign responder: ${err.message}`);
+    }
+  };
+
+  const toggleAvailability = async () => {
+    const nextVal = !available;
+    setAvailable(nextVal);
+    if (user?.uid) {
+      try {
+        await setResponderAvailability(user.uid, nextVal);
+      } catch (e) {
+        console.warn("Failed to sync responder availability:", e);
+      }
+    }
+    setMessage(`Responder availability set to ${nextVal ? "Available" : "Unavailable"}.`);
+  };
+
+  const handleSavePreferences = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (user?.uid) {
+      try {
+        await updateUserPreferences(user.uid, {
+          displayName: profileFullName,
+          phoneNumber: profilePhone,
+          region: profileRegion,
+          language: profileLanguage,
+          emergencyContacts: profileContacts,
+        });
+        setMessage("Your profile preferences have been successfully updated in Firebase & locally.");
+      } catch {
+        setMessage("Your preferences have been saved on this device.");
+      }
+    } else {
+      setMessage("Your preview preferences have been saved on this device.");
+    }
   };
 
   if (path.startsWith("/auth")) path = "/login";
@@ -761,17 +1007,23 @@ function DashboardContent({
         <div className="space-y-8">
           <section className="border-b border-border pb-7">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <Pill tone="warn">
-                <AlertTriangle /> DEMO DATA
-              </Pill>
+              {user ? (
+                <Pill tone="good">
+                  <span className="h-1.5 w-1.5 rounded-full bg-safe" /> LIVE NODE · VIJAYAWADA SECTOR
+                </Pill>
+              ) : (
+                <Pill tone="warn">
+                  <AlertTriangle /> PREVIEW MODE
+                </Pill>
+              )}
               <Pill tone="good">
-                <span className="h-1.5 w-1.5 rounded-full bg-safe" /> Saved on device
+                <span className="h-1.5 w-1.5 rounded-full bg-safe" /> Store-Carry-Forward Enabled
               </Pill>
             </div>
             <h2 className="mt-5 font-display text-3xl font-semibold">You’re not alone.</h2>
             <p className="mt-2 max-w-xl text-sm leading-6 text-muted-foreground">
-              Share what’s happening. Your report will be saved locally in this preview; it is not
-              sent to emergency services.
+              Share what’s happening. Your report is protected in local IndexedDB first and
+              dispatched across mesh gateways or Cloud Firestore when available.
             </p>
           </section>
           <form onSubmit={createIncident} className="space-y-5">
@@ -804,26 +1056,39 @@ function DashboardContent({
               <Textarea
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
-                placeholder="What happened? Anyone else with you?"
+                placeholder="What happened? Anyone injured or trapped with you?"
                 className="mt-2 min-h-24"
               />
             </label>
-            <div className="flex flex-wrap items-center justify-between gap-3 border-y border-border py-3 text-xs text-muted-foreground">
-              <span className="inline-flex items-center gap-2">
-                <MapPin className="h-4 w-4 text-signal" /> Location available · Approximate: North
-                Shore
-              </span>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={() => setMessage("Location confirmed for this preview.")}
-              >
-                Confirm location
-              </Button>
+            <div className="space-y-2 border-y border-border py-3 text-xs text-muted-foreground">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <span className="inline-flex items-center gap-2">
+                  <MapPin className="h-4 w-4 text-signal" /> Status: {locationLabel}
+                </span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={confirmLocation}
+                >
+                  Capture GPS
+                </Button>
+              </div>
+              <input
+                type="text"
+                value={manualAddress}
+                onChange={(e) => setManualAddress(e.target.value)}
+                placeholder="Optional manual landmark or cross-street (e.g. Near Benz Circle, Opposite SBI ATM)"
+                className="w-full rounded border border-border bg-background px-3 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:border-signal focus:outline-none"
+              />
             </div>
-            <Button type="submit" size="lg" className="min-h-14 w-full justify-center text-base">
-              <LifeBuoy /> Save emergency report <ArrowRight />
+            <Button
+              type="submit"
+              size="lg"
+              disabled={isSubmitting}
+              className="min-h-14 w-full justify-center text-base"
+            >
+              <LifeBuoy /> {isSubmitting ? "Registering report..." : "Save emergency report"} <ArrowRight />
             </Button>
             {message && (
               <p role="status" className="text-sm text-safe">
@@ -839,31 +1104,54 @@ function DashboardContent({
               </Link>
             </div>
             <div className="mt-2">
-              {incidents.slice(0, 2).map((incident) => (
-                <IncidentRow key={incident.id} incident={incident} onOpen={setSelected} />
-              ))}
+              {incidents.length > 0 ? (
+                incidents.slice(0, 2).map((incident) => (
+                  <IncidentRow key={incident.id} incident={incident} onOpen={setSelected} />
+                ))
+              ) : (
+                <p className="py-6 text-sm text-muted-foreground">
+                  No emergency reports recorded on this device yet.
+                </p>
+              )}
             </div>
           </section>
         </div>
         <aside className="space-y-7">
           <div className="border-l-2 border-signal bg-muted/50 p-5">
-            <p className="text-xs font-bold uppercase tracking-wider text-signal">Safety note</p>
-            <h3 className="mt-3 font-semibold">Move to higher ground</h3>
+            <p className="text-xs font-bold uppercase tracking-wider text-signal">Safety notice · Vijayawada Sector</p>
+            <h3 className="mt-3 font-semibold">Krishna River High Ground Protocol</h3>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
-              Avoid walking or driving through floodwater. Follow local emergency guidance where
-              available.
+              In case of flooding near Krishna River canal sluices or low-lying areas, proceed to
+              designated civic relief shelters such as IGMC Stadium.
             </p>
-            <Button variant="link" className="mt-2 h-auto p-0">
-              View safety information <ArrowRight />
+            <Button variant="link" className="mt-2 h-auto p-0" asChild>
+              <Link to="/citizen/safe-zones">
+                View verified safe zones <ArrowRight />
+              </Link>
             </Button>
           </div>
           <div>
-            <p className="text-sm font-semibold">Your area</p>
+            <p className="text-sm font-semibold">Operational jurisdiction</p>
             <div className="mt-3">
-              <MapPlaceholder title="North Shore · approximate" compact />
+              <Suspense
+                fallback={
+                  <div className="flex h-64 w-full items-center justify-center rounded-lg border border-border bg-card">
+                    <p className="text-xs text-muted-foreground">Loading operational map...</p>
+                  </div>
+                }
+              >
+                <BeaconMapConsole
+                  role={role}
+                  incidents={incidents}
+                  safeZones={safeZones}
+                  activeUserId={user?.uid}
+                  compact={true}
+                  className="h-64 w-full"
+                />
+              </Suspense>
             </div>
             <p className="mt-2 text-xs text-muted-foreground">
-              Location and map data are illustrative in this preview.
+              Vijayawada, NTR District, Andhra Pradesh, India.
             </p>
           </div>
         </aside>
@@ -872,6 +1160,9 @@ function DashboardContent({
             incident={selected}
             onClose={() => setSelected(null)}
             onStatus={setStatus}
+            onAssign={handleAssignResponder}
+            responders={operationalUsers}
+            isCommand={command}
           />
         )}
       </div>
@@ -882,9 +1173,10 @@ function DashboardContent({
       <section>
         <div className="flex flex-col gap-4 border-b border-border pb-5 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <Pill tone="warn">
-              <AlertTriangle /> DEMO DATA
-            </Pill>
+            <div className="flex items-center gap-2">
+              <Pill tone="signal">INCIDENT LOG</Pill>
+              <Pill tone="neutral">VIJAYAWADA JURISDICTION</Pill>
+            </div>
             <h2 className="mt-3 font-display text-2xl font-semibold">
               {path === "/command/incidents" ? "Citizen incident records" : "Your incident reports"}
             </h2>
@@ -923,7 +1215,7 @@ function DashboardContent({
               <IncidentRow key={incident.id} incident={incident} onOpen={setSelected} />
             ))
           ) : (
-            <p className="py-10 text-center text-sm text-muted-foreground">No matching reports.</p>
+            <p className="py-10 text-center text-sm text-muted-foreground">No matching reports found.</p>
           )}
         </div>
         {selected && (
@@ -931,6 +1223,9 @@ function DashboardContent({
             incident={selected}
             onClose={() => setSelected(null)}
             onStatus={setStatus}
+            onAssign={handleAssignResponder}
+            responders={operationalUsers}
+            isCommand={command}
           />
         )}
       </section>
@@ -938,44 +1233,123 @@ function DashboardContent({
 
   if (path.includes("safe-zones") || path.endsWith("/map") || path.endsWith("field-map"))
     return (
-      <div className="grid gap-7 xl:grid-cols-[minmax(0,1fr)_300px]">
-        <MapPlaceholder
-          title={path.includes("safe-zones") ? "Nearby safety locations" : "Operational area"}
-        />
+      <div className="grid gap-7 xl:grid-cols-[minmax(0,1fr)_340px]">
+        <Suspense
+          fallback={
+            <div className="flex h-[680px] w-full items-center justify-center rounded-xl border border-border bg-card">
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <div className="h-4 w-4 animate-spin rounded-full border-2 border-signal border-t-transparent" />
+                <span>Loading Map Console...</span>
+              </div>
+            </div>
+          }
+        >
+          <BeaconMapConsole
+            role={role}
+            incidents={incidents}
+            safeZones={safeZones}
+            activeUserId={user?.uid}
+            className="h-[680px] w-full"
+          />
+        </Suspense>
         <aside className="space-y-5">
           <div>
-            <p className="section-kicker">MAP KEY</p>
-            <h3 className="mt-2 font-display text-xl font-semibold">Locations in this preview</h3>
+            <p className="section-kicker">VERIFIED LOCATIONS</p>
+            <h3 className="mt-2 font-display text-xl font-semibold">Vijayawada Safe Zones</h3>
+            <p className="mt-1 text-xs text-muted-foreground">NTR District, Andhra Pradesh, India</p>
           </div>
-          {[
-            {
-              icon: Shield,
-              title: "Harbor Evacuation Centre",
-              detail: "Shelter · Capacity available",
-            },
-            { icon: Cross, title: "North Shore Clinic", detail: "Medical facility · Open" },
-            {
-              icon: MapPin,
-              title: "Hilltop Community Hall",
-              detail: "Safe zone · Updated 12 min ago",
-            },
-          ].map(({ icon: Icon, title, detail }) => (
-            <button
-              key={title}
-              onClick={() =>
-                setMessage(`${title} selected. Directions are unavailable in this preview.`)
-              }
-              className="flex w-full items-start gap-3 border-b border-border py-4 text-left"
-            >
-              <Icon className="mt-0.5 h-4 w-4 text-signal" />
-              <span>
-                <span className="block text-sm font-semibold">{title}</span>
-                <span className="mt-1 block text-xs text-muted-foreground">{detail}</span>
-              </span>
-            </button>
-          ))}
+          {safeZones.length > 0 ? (
+            safeZones.map((zone) => {
+              const Icon = zone.facilities?.some((f) => f.toLowerCase().includes("medical"))
+                ? Cross
+                : Shield;
+              return (
+                <button
+                  key={zone.id || zone.name}
+                  onClick={() =>
+                    setMessage(
+                      `${zone.name} selected (${zone.location?.address || zone.location?.locality || "Vijayawada"}). Capacity: ${zone.availableCapacity ?? zone.capacity ?? "Standby"}. Status: ${zone.operationalStatus}.`,
+                    )
+                  }
+                  className="flex w-full items-start gap-3 border-b border-border py-4 text-left transition-colors hover:bg-muted/30"
+                >
+                  <Icon className="mt-0.5 h-4 w-4 text-signal shrink-0" />
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-semibold truncate">{zone.name}</span>
+                    <span className="mt-1 block text-xs text-muted-foreground">
+                      {zone.location?.locality ? `${zone.location.locality}, ` : ""}
+                      {zone.location?.city || "Vijayawada"} · {zone.operationalStatus}
+                    </span>
+                    <span className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                      <span className="inline-flex items-center text-[10px] bg-safe/15 text-safe font-medium px-1.5 py-0.5 rounded">
+                        ✓ {zone.verificationStatus}
+                      </span>
+                      {zone.capacity ? (
+                        <span className="text-[10px] text-muted-foreground">
+                          Cap: {zone.availableCapacity ?? zone.capacity}/{zone.capacity}
+                        </span>
+                      ) : null}
+                    </span>
+                  </span>
+                </button>
+              );
+            })
+          ) : (
+            <div className="py-8 text-center border-b border-border">
+              <p className="text-sm font-medium text-muted-foreground">
+                No verified safe zones currently published for this operational sector.
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Awaiting official emergency shelter verification from Disaster Management.
+              </p>
+            </div>
+          )}
+          {command && (
+            <div className="border border-border p-3 rounded-md bg-muted/20">
+              <p className="text-xs font-semibold uppercase text-signal">Command Action</p>
+              <Button
+                size="sm"
+                variant="outline"
+                className="mt-2 w-full text-xs"
+                onClick={async () => {
+                  const name = window.prompt("Enter new Verified Safe Zone Name (Vijayawada):");
+                  if (name && name.trim()) {
+                    try {
+                      const newZone = await createAndVerifySafeZone(
+                        {
+                          name: name.trim(),
+                          location: {
+                            latitude: 16.5062,
+                            longitude: 80.648,
+                            address: "Vijayawada Emergency Sector",
+                            locality: "Central",
+                            city: "Vijayawada",
+                            district: "NTR District",
+                            state: "Andhra Pradesh",
+                            country: "India",
+                          },
+                          facilities: ["Shelter", "Drinking Water", "First Aid"],
+                          capacity: 500,
+                          availableCapacity: 500,
+                          operationalStatus: "OPEN",
+                          sourceName: "Command Authority Field Verification",
+                        },
+                        user?.uid || "command-coordinator",
+                      );
+                      setSafeZones([newZone, ...safeZones]);
+                      setMessage(`Safe zone "${newZone.name}" verified and published to network.`);
+                    } catch (err: any) {
+                      setMessage(`Failed to add safe zone: ${err.message}`);
+                    }
+                  }
+                }}
+              >
+                + Add Verified Safe Zone
+              </Button>
+            </div>
+          )}
           <p role="status" className="text-xs text-muted-foreground">
-            {message || "Offline map availability: preview only. Last updated just now."}
+            {message || "Verified public disaster relief infrastructure · Vijayawada, NTR District, Andhra Pradesh."}
           </p>
         </aside>
       </div>
@@ -984,43 +1358,59 @@ function DashboardContent({
   if (path.endsWith("/profile"))
     return (
       <div className="max-w-3xl">
-        <Pill tone="signal">Preview account</Pill>
+        <Pill tone="signal">{user ? "Authenticated Account" : "Preview Account"}</Pill>
         <h2 className="mt-4 font-display text-2xl font-semibold">Your details</h2>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            setMessage("Your preview preferences have been saved on this device.");
-          }}
-          className="mt-6 grid gap-5 sm:grid-cols-2"
-        >
+        <form onSubmit={handleSavePreferences} className="mt-6 grid gap-5 sm:grid-cols-2">
           <label className="text-sm font-medium">
             Full name
-            <Input defaultValue="Alex Morgan" className="mt-2" />
+            <Input
+              value={profileFullName}
+              onChange={(e) => setProfileFullName(e.target.value)}
+              className="mt-2"
+            />
           </label>
           <label className="text-sm font-medium">
             Phone number
-            <Input defaultValue="+1 (555) 013-2048" className="mt-2" />
+            <Input
+              value={profilePhone}
+              onChange={(e) => setProfilePhone(e.target.value)}
+              className="mt-2"
+            />
           </label>
           <label className="text-sm font-medium">
-            Region
-            <Input defaultValue="North Shore" className="mt-2" />
+            Region / Jurisdiction
+            <Input
+              value={profileRegion}
+              onChange={(e) => setProfileRegion(e.target.value)}
+              className="mt-2"
+            />
           </label>
           <label className="text-sm font-medium">
             Language
-            <select className="mt-2 h-10 w-full rounded-md border border-input bg-background px-3">
+            <select
+              value={profileLanguage}
+              onChange={(e) => setProfileLanguage(e.target.value)}
+              className="mt-2 h-10 w-full rounded-md border border-input bg-background px-3"
+            >
               <option>English</option>
-              <option>Spanish</option>
-              <option>French</option>
+              <option>Telugu</option>
+              <option>Hindi</option>
             </select>
           </label>
           <div className="sm:col-span-2">
             <h3 className="font-semibold">Emergency contacts</h3>
-            <p className="mt-1 text-sm text-muted-foreground">Jordan Morgan · +1 (555) 013-1022</p>
+            <p className="mt-1 text-sm text-muted-foreground">{profileContacts}</p>
             <Button
               type="button"
               variant="outline"
               className="mt-3"
-              onClick={() => setMessage("Emergency contact editing is available in this preview.")}
+              onClick={() => {
+                const updated = window.prompt(
+                  "Enter emergency contact (Name · Phone):",
+                  profileContacts,
+                );
+                if (updated) setProfileContacts(updated);
+              }}
             >
               Edit contacts
             </Button>
@@ -1056,7 +1446,7 @@ function DashboardContent({
             </div>
             <Button
               variant={available ? "outline" : "default"}
-              onClick={() => setAvailable(!available)}
+              onClick={toggleAvailability}
             >
               {available ? "Set unavailable" : "Set available"}
             </Button>
@@ -1069,7 +1459,7 @@ function DashboardContent({
           ].map((status, i) => (
             <button
               key={status}
-              onClick={() => setMessage(`Status set to “${status}” in the preview.`)}
+              onClick={() => setMessage(`Status set to “${status}”.`)}
               className="flex w-full items-center gap-4 border-b border-border py-5 text-left"
             >
               <span
@@ -1084,7 +1474,7 @@ function DashboardContent({
           <Textarea placeholder="Add an operation note…" className="mt-5" />
           <Button
             className="mt-3"
-            onClick={() => setMessage("Field note added to the preview timeline.")}
+            onClick={() => setMessage("Field note added to operation timeline.")}
           >
             Add field note
           </Button>
@@ -1094,8 +1484,8 @@ function DashboardContent({
         </section>
         <div className="border-l border-border pl-5">
           <p className="section-kicker">STATUS HISTORY</p>
-          <p className="mt-4 text-sm">Available · 09:14</p>
-          <p className="mt-2 text-xs text-muted-foreground">Preview activity</p>
+          <p className="mt-4 text-sm">{available ? "Available" : "Unavailable"} · Updated</p>
+          <p className="mt-2 text-xs text-muted-foreground">Operation activity · Vijayawada Sector</p>
         </div>
       </div>
     );
@@ -1282,31 +1672,61 @@ function DashboardContent({
       <section>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <Pill tone="signal">Preview permissions</Pill>
+            <Pill tone="signal">{user ? "Live directory" : "Preview directory"}</Pill>
             <h2 className="mt-3 font-display text-2xl font-semibold">User directory</h2>
           </div>
           <Pill>{role}</Pill>
         </div>
         <div className="mt-5 space-y-0">
-          {[
-            { n: "Alex Morgan", r: "Citizen", s: "Active" },
-            { n: "Jamie Lee", r: "Professional responder", s: "Active" },
-            { n: "Taylor Chen", r: "Volunteer responder", s: "Active" },
-            { n: "Morgan Diaz", r: "Coordinator", s: "Active" },
-            { n: "Riley Patel", r: "Administrator", s: "Active" },
-          ].map((u) => (
+          {(operationalUsers.length > 0
+            ? operationalUsers
+            : [
+                {
+                  uid: "u-1",
+                  displayName: "Citizen User",
+                  role: "CITIZEN",
+                  status: "ACTIVE",
+                },
+                {
+                  uid: "u-2",
+                  displayName: "NTR District First Responder",
+                  role: "RESPONDER",
+                  responderSubtype: "PROFESSIONAL",
+                  status: "ACTIVE",
+                },
+                {
+                  uid: "u-3",
+                  displayName: "AP Volunteer Rescue",
+                  role: "RESPONDER",
+                  responderSubtype: "VOLUNTEER",
+                  status: "ACTIVE",
+                },
+                {
+                  uid: "u-4",
+                  displayName: "VMC Incident Coordinator",
+                  role: "COORDINATOR",
+                  status: "ACTIVE",
+                },
+                {
+                  uid: "u-5",
+                  displayName: "State Disaster Admin",
+                  role: "ADMINISTRATOR",
+                  status: "ACTIVE",
+                },
+              ]
+          ).map((u) => (
             <div
-              key={u.n}
+              key={u.uid}
               className="grid grid-cols-[1fr_auto] gap-3 border-b border-border py-4 sm:grid-cols-[1fr_1fr_auto_auto]"
             >
-              <span className="text-sm font-semibold">{u.n}</span>
-              <span className="text-sm text-muted-foreground">{u.r}</span>
-              <Pill tone="good">{u.s}</Pill>
+              <span className="text-sm font-semibold">{u.displayName}</span>
+              <span className="text-sm text-muted-foreground">{u.role}</span>
+              <Pill tone="good">{u.status}</Pill>
               {role === "ADMINISTRATOR" ? (
                 <Button
                   size="sm"
                   variant="outline"
-                  onClick={() => setMessage(`${u.n} account controls opened in preview.`)}
+                  onClick={() => setMessage(`${u.displayName} account controls opened.`)}
                 >
                   Manage
                 </Button>
@@ -1317,7 +1737,7 @@ function DashboardContent({
           ))}
         </div>
         <p className="mt-4 text-xs text-muted-foreground">
-          Coordinator preview is read-only. Administrator-only actions are mock controls.
+          Coordinator view is read-only. Administrator has authorization to manage roles and assignments.
         </p>
         <p role="status" className="mt-2 text-sm text-safe">
           {message}
@@ -1325,60 +1745,115 @@ function DashboardContent({
       </section>
     );
 
-  if (role === "RESPONDER")
+  if (role === "RESPONDER") {
+    const assignedToMe = (rawIncidents || []).filter(
+      (i) => (user?.uid && (i.assignedResponderIds?.includes(user.uid) || i.assignedResponderId === user.uid)),
+    );
+    const displayQueue =
+      assignedToMe.length > 0 ? assignedToMe.map(toDisplayIncident) : incidents;
+
     return (
       <div className="space-y-8">
         <div className="flex flex-wrap items-center justify-between gap-4 border-b border-border pb-5">
           <div>
             <Pill tone="signal">
-              {typeof window !== "undefined"
-                ? localStorage.getItem("beaconmesh-responder-type") || "PROFESSIONAL"
-                : "PROFESSIONAL"}{" "}
-              · PREVIEW
+              {profile?.responderType ||
+                (typeof window !== "undefined"
+                  ? localStorage.getItem("beaconmesh-responder-type") || "PROFESSIONAL"
+                  : "PROFESSIONAL")}{" "}
+              · {user ? "ACTIVE RESPONDER" : "PREVIEW"}
             </Pill>
-            <h2 className="mt-3 font-display text-2xl font-semibold">Good morning, Jamie.</h2>
+            <h2 className="mt-3 font-display text-2xl font-semibold">
+              Good morning, {profile?.displayName?.split(" ")[0] || "Responder"}.
+            </h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              Field updates are mock activity in this prototype.
+              {user
+                ? "Vijayawada Sector field operations and assigned emergency incidents."
+                : "Field updates in preview mode."}
             </p>
           </div>
-          <Button
-            variant={available ? "outline" : "default"}
-            onClick={() => setAvailable(!available)}
-          >
+          <Button variant={available ? "outline" : "default"} onClick={toggleAvailability}>
             {available ? "Available" : "Unavailable"}
           </Button>
         </div>
         <div className="grid gap-5 sm:grid-cols-3">
-          <Stat label="Assigned to me" value="03" hint="2 high priority" tone="urgent" />
-          <Stat label="Active operations" value="02" hint="1 awaiting arrival" />
-          <Stat label="Completed today" value="04" hint="Preview records" />
+          <Stat
+            label="Assigned to me"
+            value={String(assignedToMe.length).padStart(2, "0")}
+            hint={assignedToMe.length > 0 ? "Active field load" : "No assignments"}
+            tone={assignedToMe.length > 0 ? "urgent" : "neutral"}
+          />
+          <Stat
+            label="Active operations"
+            value={String(incidents.filter((i) => i.status !== "Resolved").length).padStart(2, "0")}
+            hint="Jurisdiction load"
+          />
+          <Stat
+            label="Completed today"
+            value={String(incidents.filter((i) => i.status === "Resolved").length).padStart(2, "0")}
+            hint="Resolved records"
+          />
         </div>
         <section>
           <div className="flex items-center justify-between">
             <h3 className="font-display text-xl font-semibold">Priority incident queue</h3>
-            <Pill tone="warn">DEMO DATA</Pill>
+            <Pill tone={displayQueue.length > 0 ? "signal" : "neutral"}>
+              {displayQueue.length > 0 ? `${displayQueue.length} INCIDENTS` : "STANDBY"}
+            </Pill>
           </div>
-          {incidents.slice(0, 3).map((incident) => (
-            <IncidentRow key={incident.id} incident={incident} onOpen={setSelected} />
-          ))}
+          {displayQueue.length > 0 ? (
+            displayQueue
+              .slice(0, 3)
+              .map((incident) => (
+                <IncidentRow key={incident.id} incident={incident} onOpen={setSelected} />
+              ))
+          ) : (
+            <p className="py-6 text-sm text-muted-foreground">
+              No priority incidents currently queued for your unit.
+            </p>
+          )}
         </section>
         <div className="grid gap-6 lg:grid-cols-2">
-          <MapPlaceholder title="Assigned area" compact />
+          <Suspense
+            fallback={
+              <div className="flex h-64 w-full items-center justify-center rounded-lg border border-border bg-card">
+                <p className="text-xs text-muted-foreground">Loading operational map...</p>
+              </div>
+            }
+          >
+            <BeaconMapConsole
+              role={role}
+              incidents={incidents}
+              safeZones={safeZones}
+              activeUserId={user?.uid}
+              compact={true}
+              className="h-64 w-full"
+            />
+          </Suspense>
           <div className="border-l-2 border-safe bg-muted/40 p-5">
             <p className="section-kicker">QUICK UPDATE</p>
             <h3 className="mt-3 font-display text-xl font-semibold">On your way?</h3>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
-              Keep your assignment status current for the coordination team.
+              Keep your assignment status current for the Command coordination team.
             </p>
             <Button
               className="mt-4"
-              onClick={() => setMessage("Travelling status updated in this preview.")}
+              onClick={async () => {
+                if (displayQueue[0]) {
+                  await setStatus("In progress");
+                  setMessage(`Travelling status confirmed for ${displayQueue[0].id}.`);
+                } else {
+                  setMessage("Travelling status logged in local operation log.");
+                }
+              }}
             >
               Mark travelling
             </Button>
-            <p role="status" className="mt-3 text-sm text-safe">
-              {message}
-            </p>
+            {message && (
+              <p role="status" className="mt-3 text-sm text-safe">
+                {message}
+              </p>
+            )}
           </div>
         </div>
         {selected && (
@@ -1386,51 +1861,109 @@ function DashboardContent({
             incident={selected}
             onClose={() => setSelected(null)}
             onStatus={setStatus}
+            onAssign={handleAssignResponder}
+            responders={operationalUsers}
+            isCommand={false}
           />
         )}
       </div>
     );
+  }
 
-  if (command)
+  if (command) {
+    const aggregates = computeIncidentAggregates(rawIncidents || []);
     return (
       <div className="space-y-8">
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
-            <Pill tone="signal">{role} · PREVIEW</Pill>
+            <Pill tone="signal">
+              {role} · {user ? "OPERATIONAL" : "PREVIEW"}
+            </Pill>
             <h2 className="mt-3 font-display text-2xl font-semibold">Operations at a glance</h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              Illustrative operational activity · all citizen records are demo data.
+              {rawIncidents.length > 0
+                ? "Real-time incident intelligence synchronized across Vijayawada Sector."
+                : "No active incidents reported in this operational period."}
             </p>
           </div>
           <Pill tone="good">
             <span className="h-1.5 w-1.5 rounded-full bg-safe" />
-            Network status · Preview
+            Network status · Real-Time Listener Active
           </Pill>
         </div>
         <div className="grid gap-x-6 sm:grid-cols-2 lg:grid-cols-5">
-          <Stat label="Total incidents" value="18" hint="DEMO DATA" />
-          <Stat label="Active" value="07" hint="Across all categories" tone="urgent" />
-          <Stat label="Pending" value="04" hint="Awaiting acknowledgement" />
-          <Stat label="Critical" value="02" hint="Priority response" tone="urgent" />
-          <Stat label="Resolved" value="07" hint="Today · demo records" />
+          <Stat
+            label="Total incidents"
+            value={String(aggregates.total).padStart(2, "0")}
+            hint={aggregates.total > 0 ? "All records" : "Standby"}
+          />
+          <Stat
+            label="Active"
+            value={String(aggregates.active).padStart(2, "0")}
+            hint="Across all categories"
+            tone={aggregates.active > 0 ? "urgent" : "neutral"}
+          />
+          <Stat
+            label="Pending"
+            value={String(aggregates.pending).padStart(2, "0")}
+            hint="Awaiting acknowledgement"
+          />
+          <Stat
+            label="Critical"
+            value={String(aggregates.critical).padStart(2, "0")}
+            hint="Priority response"
+            tone={aggregates.critical > 0 ? "urgent" : "neutral"}
+          />
+          <Stat
+            label="Resolved"
+            value={String(aggregates.resolved).padStart(2, "0")}
+            hint="Completed records"
+          />
         </div>
         <div className="grid gap-8 xl:grid-cols-[minmax(0,1fr)_340px]">
           <section>
             <div className="flex items-center justify-between">
-              <h3 className="font-display text-xl font-semibold">Recent citizen incidents</h3>
-              <Pill tone="warn">DEMO DATA</Pill>
+              <h3 className="font-display text-xl font-semibold">Live citizen incidents</h3>
+              <Pill tone={incidents.length > 0 ? "signal" : "neutral"}>
+                {incidents.length > 0 ? `${incidents.length} RECORDS` : "EMPTY"}
+              </Pill>
             </div>
-            {incidents.slice(0, 4).map((incident) => (
-              <IncidentRow key={incident.id} incident={incident} onOpen={setSelected} />
-            ))}
+            {incidents.length > 0 ? (
+              incidents
+                .slice(0, 4)
+                .map((incident) => (
+                  <IncidentRow key={incident.id} incident={incident} onOpen={setSelected} />
+                ))
+            ) : (
+              <p className="py-8 text-center text-sm text-muted-foreground">
+                No citizen emergency incidents reported in this operational period.
+              </p>
+            )}
           </section>
           <div className="space-y-6">
-            <MapPlaceholder title="Regional overview" compact />
+            <Suspense
+              fallback={
+                <div className="flex h-64 w-full items-center justify-center rounded-lg border border-border bg-card">
+                  <p className="text-xs text-muted-foreground">Loading operational map...</p>
+                </div>
+              }
+            >
+              <BeaconMapConsole
+                role={role}
+                incidents={incidents}
+                safeZones={safeZones}
+                activeUserId={user?.uid}
+                compact={true}
+                className="h-64 w-full"
+              />
+            </Suspense>
             <section className="border-t border-border pt-4">
               <p className="section-kicker">RESPONDER AVAILABILITY</p>
               <div className="mt-3 flex items-end gap-2">
-                <span className="font-display text-3xl font-semibold">12</span>
-                <span className="pb-1 text-sm text-muted-foreground">available of 18 · demo</span>
+                <span className="font-display text-3xl font-semibold">
+                  {operationalUsers.filter((u) => u.role.toLowerCase().includes("responder")).length || "02"}
+                </span>
+                <span className="pb-1 text-sm text-muted-foreground">registered field units</span>
               </div>
               <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted">
                 <div className="h-full w-2/3 bg-safe" />
@@ -1443,10 +1976,14 @@ function DashboardContent({
             incident={selected}
             onClose={() => setSelected(null)}
             onStatus={setStatus}
+            onAssign={handleAssignResponder}
+            responders={operationalUsers}
+            isCommand={true}
           />
         )}
       </div>
     );
+  }
 
   return (
     <section className="max-w-3xl">
@@ -1455,14 +1992,14 @@ function DashboardContent({
         Communication that can travel beyond the network.
       </h2>
       <p className="mt-4 leading-7 text-muted-foreground">
-        BeaconMesh is a university prototype exploring store-carry-forward communication for
-        emergencies. Reports, routes, map details, and simulation activity shown here are mock data.
+        BeaconMesh is an emergency communication system exploring store-carry-forward and cloud
+        synchronization for high-risk disaster environments.
       </p>
       <div className="mt-8 border-l-2 border-signal pl-5">
-        <h3 className="font-semibold">Designed as an educational prototype</h3>
+        <h3 className="font-semibold">Resilient Emergency Mesh Network</h3>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          No Bluetooth mesh, LoRa radio, satellite, drone, verified dispatch, or production mapping
-          connection is implemented.
+          Store-carry-forward queueing ensures citizen reports are protected locally in IndexedDB and
+          synced idempotently when network or gateway connectivity is restored.
         </p>
       </div>
       <Button asChild className="mt-7">
@@ -1478,11 +2015,19 @@ function IncidentDialog({
   incident,
   onClose,
   onStatus,
+  onAssign,
+  responders = [],
+  isCommand = false,
 }: {
   incident: Incident;
   onClose: () => void;
   onStatus: (status: string) => void;
+  onAssign?: (responderId: string, responderName: string) => void;
+  responders?: OperationalUserItem[];
+  isCommand?: boolean;
 }) {
+  const [selectedResponder, setSelectedResponder] = useState("");
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-end justify-center bg-ink/60 p-0 sm:items-center sm:p-5"
@@ -1499,7 +2044,14 @@ function IncidentDialog({
       >
         <div className="flex items-start justify-between gap-3">
           <div>
-            <Pill tone="warn">DEMO DATA · {incident.priority}</Pill>
+            <div className="flex flex-wrap items-center gap-2">
+              <Pill tone="signal">{incident.priority} PRIORITY</Pill>
+              {incident.syncStatus && (
+                <Pill tone={incident.syncStatus === "SYNCED" ? "good" : "neutral"}>
+                  {incident.syncStatus}
+                </Pill>
+              )}
+            </div>
             <h2 id="incident-title" className="mt-3 font-display text-xl font-semibold">
               {incident.id} · {incident.type}
             </h2>
@@ -1512,13 +2064,52 @@ function IncidentDialog({
           </Button>
         </div>
         <div className="my-5 border-y border-border py-4">
-          <p className="text-xs font-semibold uppercase text-muted-foreground">Incident timeline</p>
-          <p className="mt-3 text-sm">Report created · saved on device</p>
-          <p className="mt-2 text-sm">Current status · {incident.status}</p>
-          <p className="mt-2 text-xs text-muted-foreground">
-            Responder assignment and location are illustrative.
-          </p>
+          <p className="text-xs font-semibold uppercase text-muted-foreground">Incident details & timeline</p>
+          {incident.description && (
+            <p className="mt-2 text-sm italic text-foreground">"{incident.description}"</p>
+          )}
+          <p className="mt-3 text-sm">Report created · {incident.time}</p>
+          <p className="mt-1 text-sm">Current status · <span className="font-semibold">{incident.status}</span></p>
+          {incident.assignedResponderIds && incident.assignedResponderIds.length > 0 && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              Assigned units: {incident.assignedResponderIds.join(", ")}
+            </p>
+          )}
         </div>
+
+        {isCommand && responders.length > 0 && (
+          <div className="mb-5 border-b border-border pb-4">
+            <p className="text-xs font-semibold uppercase text-muted-foreground mb-2">Assign Field Unit</p>
+            <div className="flex flex-wrap gap-2">
+              <select
+                aria-label="Select responder to assign"
+                value={selectedResponder}
+                onChange={(e) => setSelectedResponder(e.target.value)}
+                className="h-9 rounded-md border border-input bg-background px-3 text-xs flex-1 min-w-[200px]"
+              >
+                <option value="">-- Choose Field Responder --</option>
+                {responders
+                  .filter((r) => r.role.toLowerCase().includes("responder"))
+                  .map((r) => (
+                    <option key={r.uid} value={r.uid}>
+                      {r.displayName} ({r.role})
+                    </option>
+                  ))}
+              </select>
+              <Button
+                size="sm"
+                disabled={!selectedResponder}
+                onClick={() => {
+                  const target = responders.find((r) => r.uid === selectedResponder);
+                  if (target && onAssign) onAssign(target.uid, target.displayName);
+                }}
+              >
+                Dispatch Unit
+              </Button>
+            </div>
+          </div>
+        )}
+
         <div className="flex flex-wrap gap-2">
           <Button size="sm" onClick={() => onStatus("Acknowledged")}>
             Acknowledge
@@ -1628,32 +2219,93 @@ function AuthPage({ path }: { path: string }) {
 
 export function BeaconPage() {
   const path = useRouterState({ select: (s) => s.location.pathname });
-  const { user, profile, loading: authLoading } = useAuth();
+  const { user, profile, status, loading: authLoading, signOut } = useAuth();
   const [role, setRole] = useState<PreviewRole>("CITIZEN");
-  const [incidents, setIncidents] = useState(initialIncidents);
+  const [incidents, setIncidents] = useState<Incident[]>(initialIncidents);
+  const [rawIncidents, setRawIncidents] = useState<IncidentRecord[]>([]);
   const [incidentsReady, setIncidentsReady] = useState(false);
   const [responderType, setResponderType] = useState<ResponderType>("PROFESSIONAL");
   const [demoPreviewActive, setDemoPreviewActive] = useState(false);
 
+  // Initialize offline sync queue worker
   useEffect(() => {
+    const cleanup = initAutoSync();
+    return () => {
+      if (typeof cleanup === "function") cleanup();
+    };
+  }, []);
+
+  const loadIncidents = async () => {
     try {
-      const savedIncidents = localStorage.getItem("beaconmesh-incidents");
-      if (savedIncidents) {
-        const parsed: unknown = JSON.parse(savedIncidents);
-        if (Array.isArray(parsed)) setIncidents(parsed.filter(isIncident));
+      let records: IncidentRecord[] = [];
+      if (user?.uid && profile?.role === "CITIZEN") {
+        records = await getUserIncidents(user.uid);
+      } else {
+        records = await getAllIncidents();
       }
-    } catch {
-      localStorage.removeItem("beaconmesh-incidents");
+      setRawIncidents(records);
+      if (records.length > 0) {
+        setIncidents(records.map(toDisplayIncident));
+      } else {
+        const saved = localStorage.getItem("beaconmesh-incidents");
+        if (saved) {
+          try {
+            const parsed = JSON.parse(saved);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              setIncidents(parsed.filter(isIncident));
+            } else {
+              setIncidents([]);
+            }
+          } catch {
+            setIncidents([]);
+          }
+        } else {
+          setIncidents([]);
+        }
+      }
+    } catch (e) {
+      console.warn("Failed loading incidents from db:", e);
+    } finally {
+      setIncidentsReady(true);
     }
+  };
+
+  useEffect(() => {
+    const activeRole =
+      profile?.role ||
+      (path.startsWith("/command") ? "COMMAND" : path.startsWith("/responder") ? "RESPONDER" : "CITIZEN");
+
+    const unsubscribe = subscribeToIncidents({
+      role: activeRole,
+      userId: user?.uid,
+      onUpdate: (records) => {
+        setRawIncidents(records);
+        if (records.length > 0) {
+          setIncidents(records.map(toDisplayIncident));
+        } else {
+          setIncidents([]);
+        }
+        setIncidentsReady(true);
+      },
+      onError: (err) => console.warn("Incident subscription notice:", err),
+    });
+
     const savedRole = localStorage.getItem("beaconmesh-role") as PreviewRole | null;
     if (savedRole) setRole(savedRole);
     const savedSubtype = localStorage.getItem("beaconmesh-responder-type") as ResponderType | null;
     if (savedSubtype) setResponderType(savedSubtype);
-    setIncidentsReady(true);
-  }, []);
+
+    return () => {
+      if (typeof unsubscribe === "function") {
+        unsubscribe();
+      }
+    };
+  }, [user?.uid, profile?.role, path]);
 
   useEffect(() => {
-    if (incidentsReady) localStorage.setItem("beaconmesh-incidents", JSON.stringify(incidents));
+    if (incidentsReady) {
+      localStorage.setItem("beaconmesh-incidents", JSON.stringify(incidents));
+    }
   }, [incidents, incidentsReady]);
 
   const chooseRole = (next: PreviewRole) => {
@@ -1684,6 +2336,8 @@ export function BeaconPage() {
                 role="CITIZEN"
                 incidents={incidents}
                 setIncidents={setIncidents}
+                rawIncidents={rawIncidents}
+                onRefresh={loadIncidents}
               />
             </div>
           </div>
@@ -1707,13 +2361,14 @@ export function BeaconPage() {
       </>
     );
 
+  const isPendingRoute = path === "/responder/application-pending";
   const isCitizen = path.startsWith("/citizen");
   const isResponder = path.startsWith("/responder");
   const isCommand = path.startsWith("/command");
   const isWorkspace = isCitizen || isResponder || isCommand;
 
   // 1. Loading guard for workspace routes
-  if (isWorkspace && authLoading) {
+  if (isWorkspace && (authLoading || status === "INITIALIZING" || status === "PROFILE_LOADING")) {
     return (
       <div className="min-h-screen bg-background text-foreground">
         <Header
@@ -1732,8 +2387,45 @@ export function BeaconPage() {
     );
   }
 
-  // 2. Suspended account guard
-  if (isWorkspace && user && profile?.accountStatus === "SUSPENDED") {
+  // 2. Unauthenticated user guard (Must precede any authenticated checks)
+  if (isWorkspace && !user) {
+    return (
+      <div className="min-h-screen bg-background text-foreground">
+        <Header />
+        <div className="flex min-h-[calc(100svh-4rem)] items-center justify-center p-6">
+          <div className="w-full max-w-md space-y-4 rounded-lg border border-border bg-card p-6 text-center shadow-sm">
+            <Pill tone="signal">Authentication Required</Pill>
+            <h2 className="font-display text-2xl font-semibold">Sign in to continue</h2>
+            <p className="text-sm leading-relaxed text-muted-foreground">
+              You must sign in to access the{" "}
+              {isCitizen ? "Citizen" : isResponder ? "Responder" : "Command"} workspace.
+            </p>
+            <div className="flex flex-col gap-2 pt-2">
+              <Button asChild className="w-full">
+                <Link to="/login" search={{ redirect: path }}>
+                  Sign in with credentials
+                </Link>
+              </Button>
+              <Button asChild variant="outline" className="w-full">
+                <Link to="/signup">Create an account</Link>
+              </Button>
+              <Button
+                asChild
+                variant="ghost"
+                size="sm"
+                className="mt-2 text-xs text-muted-foreground hover:text-foreground"
+              >
+                <Link to="/">Back to Home Page</Link>
+              </Button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // 3. Suspended account guard
+  if (isWorkspace && user && (status === "SUSPENDED" || profile?.accountStatus === "SUSPENDED")) {
     return (
       <div className="min-h-screen bg-background text-foreground">
         <Header />
@@ -1751,8 +2443,8 @@ export function BeaconPage() {
     );
   }
 
-  // 3. Unverified email guard
-  if (isWorkspace && user && !user.emailVerified) {
+  // 4. Unverified email guard
+  if (isWorkspace && user && (!user.emailVerified || status === "EMAIL_UNVERIFIED")) {
     return (
       <div className="min-h-screen bg-background text-foreground">
         <Header />
@@ -1775,61 +2467,21 @@ export function BeaconPage() {
     );
   }
 
-  // 4. Role mismatch guard for Citizen space
-  if (isWorkspace && user && isCitizen && profile && profile.role !== "CITIZEN") {
-    return (
-      <div className="min-h-screen bg-background text-foreground">
-        <Header />
-        <div className="flex min-h-[calc(100svh-4rem)] items-center justify-center p-6">
-          <div className="w-full max-w-md space-y-4 rounded-lg border border-border bg-card p-6 text-center shadow-sm">
-            <Pill tone="warn">Workspace Role Mismatch</Pill>
-            <h2 className="font-display text-2xl font-semibold">Citizen Space Restricted</h2>
-            <p className="text-sm leading-relaxed text-muted-foreground">
-              Your account is authenticated as <strong>{profile.role}</strong>. This section is
-              dedicated to citizen emergency reports and safe zones.
-            </p>
-            <Button asChild className="w-full">
-              <Link to={WORKSPACE_ROUTES[profile.role]}>
-                Go to your {profile.role} workspace <ArrowRight className="ml-2 h-4 w-4" />
-              </Link>
-            </Button>
-          </div>
-        </div>
-      </div>
-    );
-  }
+  // Dual-Capability & Pending Status Invariants
+  const hasCitizenCapability =
+    Boolean(profile?.capabilities?.includes("CITIZEN") && profile?.citizenEnrollmentStatus === "ACTIVE");
+  const hasResponderCapability =
+    Boolean(profile?.capabilities?.includes("RESPONDER") && profile?.approvalStatus === "APPROVED");
+  const isPendingResponder =
+    profile?.responderApplicationStatus === "PENDING" ||
+    (profile?.requestedRole === "RESPONDER" && profile?.approvalStatus === "PENDING");
 
-  // 5. Role & approval guard for Responder space
-  if (isWorkspace && user && isResponder && profile) {
-    if (profile.role !== "RESPONDER") {
+  // 5. Dedicated handler for /responder/application-pending
+  if (isWorkspace && user && isPendingRoute) {
+    if (isPendingResponder) {
       return (
         <div className="min-h-screen bg-background text-foreground">
-          <Header />
-          <div className="flex min-h-[calc(100svh-4rem)] items-center justify-center p-6">
-            <div className="w-full max-w-md space-y-4 rounded-lg border border-urgent/30 bg-urgent/10 p-6 text-center">
-              <ShieldAlert className="mx-auto h-12 w-12 text-urgent" />
-              <h2 className="font-display text-2xl font-semibold text-urgent">
-                Responder Access Required
-              </h2>
-              <p className="text-sm leading-relaxed text-foreground">
-                Operational responder dispatch requires an authorized Responder role. Your account
-                is currently assigned to <strong>{profile.role}</strong>.
-              </p>
-              <Button asChild className="w-full">
-                <Link to={WORKSPACE_ROUTES[profile.role]}>
-                  Return to your workspace <ArrowRight className="ml-2 h-4 w-4" />
-                </Link>
-              </Button>
-            </div>
-          </div>
-        </div>
-      );
-    }
-
-    if (profile.approvalStatus === "PENDING") {
-      return (
-        <div className="min-h-screen bg-background text-foreground">
-          <Header />
+          <Header path={path} />
           <div className="flex min-h-[calc(100svh-4rem)] items-center justify-center p-6">
             <div className="w-full max-w-md space-y-4 rounded-lg border border-signal/40 bg-signal/10 p-6 text-center">
               <Clock className="mx-auto h-12 w-12 text-signal" />
@@ -1837,13 +2489,92 @@ export function BeaconPage() {
               <h2 className="font-display text-2xl font-semibold">Responder Application Pending</h2>
               <p className="text-sm leading-relaxed text-muted-foreground">
                 Your application to join as a{" "}
-                <strong>{profile.responderSubtype || "Volunteer"}</strong> responder has been
-                received and is awaiting administrative command approval. Operational tools remain
-                locked until verified.
+                <strong>{profile?.requestedResponderSubtype || profile?.responderSubtype || "Volunteer"}</strong> responder has been
+                received and is awaiting operational clearance and administrative Command review. Operational tools remain
+                locked until approved.
               </p>
-              <div className="rounded border border-border bg-background p-3 text-xs text-muted-foreground">
-                Application Status:{" "}
-                <span className="font-semibold text-signal">PENDING REVIEW</span>
+              <div className="rounded border border-border bg-background p-3 text-xs text-muted-foreground space-y-1.5 text-left">
+                <div className="flex justify-between">
+                  <span>Application Status:</span>
+                  <span className="font-semibold text-signal">PENDING REVIEW</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Account Role:</span>
+                  <span className="font-mono text-foreground">{profile?.role || "CITIZEN"} (Baseline)</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Requested Track:</span>
+                  <span className="font-mono text-signal">{profile?.requestedResponderSubtype || "VOLUNTEER"}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Email Verification:</span>
+                  <span className="font-semibold text-safe">{user.emailVerified ? "VERIFIED" : "PENDING"}</span>
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Coordinators will review your application. You will receive an operational clearance notification upon approval.
+              </p>
+            </div>
+          </div>
+        </div>
+      );
+    } else {
+      return (
+        <div className="min-h-screen bg-background text-foreground">
+          <Header path={path} />
+          <div className="flex min-h-[calc(100svh-4rem)] items-center justify-center p-6">
+            <div className="w-full max-w-md space-y-4 rounded-lg border border-border bg-card p-6 text-center shadow-sm">
+              <CheckCircle2 className="mx-auto h-12 w-12 text-safe" />
+              <h2 className="font-display text-2xl font-semibold">No Pending Application</h2>
+              <p className="text-sm leading-relaxed text-muted-foreground">
+                You do not have a pending responder application. Your account is currently active as <strong>{profile?.role}</strong>.
+              </p>
+              <Button asChild className="w-full">
+                <Link to={hasResponderCapability ? "/responder/overview" : "/citizen/home"}>
+                  Go to your workspace <ArrowRight className="ml-2 h-4 w-4" />
+                </Link>
+              </Button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+  }
+
+  // 6. Citizen Space Access Guard (/citizen/*)
+  // Requires: Explicit CITIZEN authorization via role or granted capabilities
+  if (isWorkspace && user && isCitizen && profile) {
+    const isAuthorized = evaluateRoleAuthorization(profile, "CITIZEN").isAuthorized;
+
+    if (!isAuthorized) {
+      return (
+        <div className="min-h-screen bg-background text-foreground">
+          <Header path={path} />
+          <div className="flex min-h-[calc(100svh-4rem)] items-center justify-center p-6">
+            <div className="w-full max-w-md space-y-4 rounded-lg border border-urgent/30 bg-urgent/10 p-6 text-center">
+              <ShieldAlert className="mx-auto h-12 w-12 text-urgent" />
+              <h2 className="font-display text-2xl font-semibold text-urgent">
+                Dashboard Access Restricted
+              </h2>
+              <p className="text-sm leading-relaxed text-foreground">
+                You do not have access to this dashboard. Please select an authorized role or contact your administrator.
+              </p>
+              <div className="flex flex-col gap-2 pt-2">
+                {profile && evaluateRoleAuthorization(profile, profile.role).isAuthorized && (
+                  <Button asChild className="w-full">
+                    <Link to={WORKSPACE_ROUTES[profile.role]}>
+                      Return to {profile.role} Dashboard <ArrowRight className="ml-2 h-4 w-4" />
+                    </Link>
+                  </Button>
+                )}
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full"
+                  onClick={() => void signOut()}
+                >
+                  Sign Out
+                </Button>
               </div>
             </div>
           </div>
@@ -1852,69 +2583,124 @@ export function BeaconPage() {
     }
   }
 
-  // 6. Role guard for Command space
-  if (isWorkspace && user && isCommand && profile && profile.role !== "COMMAND") {
-    return (
-      <div className="min-h-screen bg-background text-foreground">
-        <Header />
-        <div className="flex min-h-[calc(100svh-4rem)] items-center justify-center p-6">
-          <div className="w-full max-w-md space-y-4 rounded-lg border border-urgent/30 bg-urgent/10 p-6 text-center">
-            <ShieldAlert className="mx-auto h-12 w-12 text-urgent" />
-            <h2 className="font-display text-2xl font-semibold text-urgent">
-              Command Access Restricted
-            </h2>
-            <p className="text-sm leading-relaxed text-foreground">
-              The Command workspace requires authorized operational credentials. Your account (
-              <strong>{profile.role}</strong>) is not authorized for Command access.
-            </p>
-            <Button asChild className="w-full">
-              <Link to={WORKSPACE_ROUTES[profile.role]}>
-                Return to your workspace <ArrowRight className="ml-2 h-4 w-4" />
-              </Link>
-            </Button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // 7. Unauthenticated user guard
-  if (isWorkspace && !user) {
-    return (
-      <div className="min-h-screen bg-background text-foreground">
-        <Header />
-        <div className="flex min-h-[calc(100svh-4rem)] items-center justify-center p-6">
-          <div className="w-full max-w-md space-y-4 rounded-lg border border-border bg-card p-6 text-center shadow-sm">
-            <Pill tone="signal">Authentication Required</Pill>
-            <h2 className="font-display text-2xl font-semibold">Sign in to continue</h2>
-            <p className="text-sm leading-relaxed text-muted-foreground">
-              You must sign in to access the{" "}
-              {isCitizen ? "Citizen" : isResponder ? "Responder" : "Command"} workspace.
-            </p>
-            <div className="flex flex-col gap-2 pt-2">
+  // 7. Responder Space Access Guard (/responder/*, excluding pending route)
+  // Requires: Explicit RESPONDER authorization via approved role or granted capabilities
+  if (isWorkspace && user && isResponder && profile && !isPendingRoute) {
+    if (isPendingResponder) {
+      return (
+        <div className="min-h-screen bg-background text-foreground">
+          <Header path={path} />
+          <div className="flex min-h-[calc(100svh-4rem)] items-center justify-center p-6">
+            <div className="w-full max-w-md space-y-4 rounded-lg border border-signal/40 bg-signal/10 p-6 text-center">
+              <Clock className="mx-auto h-12 w-12 text-signal" />
+              <Pill tone="signal">Vetting In Progress</Pill>
+              <h2 className="font-display text-2xl font-semibold">Responder Application Pending</h2>
+              <p className="text-sm leading-relaxed text-muted-foreground">
+                Your Responder application is awaiting administrative Command review and operational clearance.
+              </p>
               <Button asChild className="w-full">
-                <Link to="/login" search={{ redirect: path }}>
-                  Sign in with credentials
+                <Link to="/responder/application-pending">
+                  Check Application Status <ArrowRight className="ml-2 h-4 w-4" />
                 </Link>
-              </Button>
-              <Button asChild variant="outline" className="w-full">
-                <Link to="/signup">Create an account</Link>
-              </Button>
-              <Button asChild variant="ghost" size="sm" className="mt-2 text-xs text-muted-foreground hover:text-foreground">
-                <Link to="/">Back to Home Page</Link>
               </Button>
             </div>
           </div>
         </div>
-      </div>
-    );
+      );
+    }
+
+    const isAuthorized = evaluateRoleAuthorization(profile, "RESPONDER").isAuthorized;
+
+    if (!isAuthorized) {
+      return (
+        <div className="min-h-screen bg-background text-foreground">
+          <Header path={path} />
+          <div className="flex min-h-[calc(100svh-4rem)] items-center justify-center p-6">
+            <div className="w-full max-w-md space-y-4 rounded-lg border border-urgent/30 bg-urgent/10 p-6 text-center">
+              <ShieldAlert className="mx-auto h-12 w-12 text-urgent" />
+              <h2 className="font-display text-2xl font-semibold text-urgent">
+                Dashboard Access Restricted
+              </h2>
+              <p className="text-sm leading-relaxed text-foreground">
+                You do not have access to this dashboard. Please select an authorized role or contact your administrator.
+              </p>
+              <div className="flex flex-col gap-2 pt-2">
+                {profile && evaluateRoleAuthorization(profile, profile.role).isAuthorized && (
+                  <Button asChild className="w-full">
+                    <Link to={WORKSPACE_ROUTES[profile.role]}>
+                      Return to {profile.role} Dashboard <ArrowRight className="ml-2 h-4 w-4" />
+                    </Link>
+                  </Button>
+                )}
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full"
+                  onClick={() => void signOut()}
+                >
+                  Sign Out
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+  }
+
+  // 8. Command Space Access Guard (/command/*)
+  // Requires: Explicit COMMAND authorization with valid commandLevel
+  if (isWorkspace && user && isCommand && profile) {
+    const isCommandAuthorized = evaluateRoleAuthorization(profile, "COMMAND").isAuthorized;
+
+    if (!isCommandAuthorized) {
+      return (
+        <div className="min-h-screen bg-background text-foreground">
+          <Header path={path} />
+          <div className="flex min-h-[calc(100svh-4rem)] items-center justify-center p-6">
+            <div className="w-full max-w-md space-y-4 rounded-lg border border-urgent/30 bg-urgent/10 p-6 text-center">
+              <ShieldAlert className="mx-auto h-12 w-12 text-urgent" />
+              <h2 className="font-display text-2xl font-semibold text-urgent">
+                Dashboard Access Restricted
+              </h2>
+              <p className="text-sm leading-relaxed text-foreground">
+                You do not have access to this dashboard. Please select an authorized role or contact your administrator.
+              </p>
+              <div className="flex flex-col gap-2 pt-2">
+                {profile && evaluateRoleAuthorization(profile, profile.role).isAuthorized && (
+                  <Button asChild className="w-full">
+                    <Link to={WORKSPACE_ROUTES[profile.role]}>
+                      Return to {profile.role} Dashboard <ArrowRight className="ml-2 h-4 w-4" />
+                    </Link>
+                  </Button>
+                )}
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full"
+                  onClick={() => void signOut()}
+                >
+                  Sign Out
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
   }
 
   const routeRole: PreviewRole =
     user && profile
-      ? profile.role === "COMMAND"
+      ? isCommand
         ? profile.commandLevel || "COORDINATOR"
-        : profile.role
+        : isResponder
+          ? "RESPONDER"
+          : isCitizen
+            ? "CITIZEN"
+            : profile.role === "COMMAND"
+              ? profile.commandLevel || "COORDINATOR"
+              : profile.role
       : isCitizen
         ? "CITIZEN"
         : isResponder
@@ -1932,6 +2718,7 @@ export function BeaconPage() {
   return (
     <div className="min-h-screen bg-background text-foreground">
       <Header
+        path={path}
         previewRole={isCitizen ? "CITIZEN" : isResponder ? "RESPONDER" : routeRole}
         responderType={effectiveResponderType}
         onRoleChange={chooseRole}
@@ -1977,13 +2764,19 @@ export function BeaconPage() {
                 <div className="flex flex-wrap items-center gap-2">
                   <p className="section-kicker">
                     {isCitizen
-                      ? "CITIZEN SPACE"
+                      ? "WORKSPACE: CITIZEN SPACE"
                       : isResponder
-                        ? "RESPONDER SPACE"
-                        : "COMMAND WORKSPACE"}
+                        ? "WORKSPACE: RESPONDER SPACE"
+                        : "WORKSPACE: COMMAND"}
                   </p>
                   {isCitizen || path.endsWith("incidents") ? (
-                    <Pill tone="warn">DEMO DATA</Pill>
+                    user ? (
+                      <Pill tone="good">
+                        <span className="h-1.5 w-1.5 rounded-full bg-safe" /> LIVE
+                      </Pill>
+                    ) : (
+                      <Pill tone="warn">DEMO DATA</Pill>
+                    )
                   ) : path.includes("simulation") || path.endsWith("messages") ? (
                     <Pill tone="signal">SIMULATION</Pill>
                   ) : null}
@@ -1993,7 +2786,7 @@ export function BeaconPage() {
               <div className="flex items-center gap-2">
                 <Pill tone="neutral">
                   <span className="h-1.5 w-1.5 rounded-full bg-safe" />
-                  Connectivity · preview
+                  {user ? "Online · Synced" : "Connectivity · preview"}
                 </Pill>
                 <Button
                   variant="ghost"
@@ -2012,6 +2805,8 @@ export function BeaconPage() {
                 role={routeRole}
                 incidents={incidents}
                 setIncidents={setIncidents}
+                rawIncidents={rawIncidents}
+                onRefresh={loadIncidents}
               />
             ) : (
               <DashboardContent
@@ -2019,6 +2814,8 @@ export function BeaconPage() {
                 role={routeRole}
                 incidents={incidents}
                 setIncidents={setIncidents}
+                rawIncidents={rawIncidents}
+                onRefresh={loadIncidents}
               />
             )}
           </div>

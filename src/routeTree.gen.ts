@@ -29,6 +29,7 @@ import { Route as CommandOverviewRouteImport } from './routes/command/overview'
 import { Route as CommandSimulationRouteImport } from './routes/command/simulation'
 import { Route as CommandUsersRouteImport } from './routes/command/users'
 import { Route as ResponderIndexRouteImport } from './routes/responder/index'
+import { Route as ResponderApplicationPendingRouteImport } from './routes/responder/application-pending'
 import { Route as ResponderFieldMapRouteImport } from './routes/responder/field-map'
 import { Route as ResponderOverviewRouteImport } from './routes/responder/overview'
 import { Route as ResponderStatusRouteImport } from './routes/responder/status'
@@ -134,6 +135,12 @@ const ResponderIndexRoute = ResponderIndexRouteImport.update({
   path: '/responder/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ResponderApplicationPendingRoute =
+  ResponderApplicationPendingRouteImport.update({
+    id: '/responder/application-pending',
+    path: '/responder/application-pending',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ResponderFieldMapRoute = ResponderFieldMapRouteImport.update({
   id: '/responder/field-map',
   path: '/responder/field-map',
@@ -174,6 +181,7 @@ export interface FileRoutesByFullPath {
   '/command/overview': typeof CommandOverviewRoute
   '/command/simulation': typeof CommandSimulationRoute
   '/command/users': typeof CommandUsersRoute
+  '/responder/application-pending': typeof ResponderApplicationPendingRoute
   '/responder/field-map': typeof ResponderFieldMapRoute
   '/responder/overview': typeof ResponderOverviewRoute
   '/responder/status': typeof ResponderStatusRoute
@@ -200,6 +208,7 @@ export interface FileRoutesByTo {
   '/command/overview': typeof CommandOverviewRoute
   '/command/simulation': typeof CommandSimulationRoute
   '/command/users': typeof CommandUsersRoute
+  '/responder/application-pending': typeof ResponderApplicationPendingRoute
   '/responder/field-map': typeof ResponderFieldMapRoute
   '/responder/overview': typeof ResponderOverviewRoute
   '/responder/status': typeof ResponderStatusRoute
@@ -227,6 +236,7 @@ export interface FileRoutesById {
   '/command/overview': typeof CommandOverviewRoute
   '/command/simulation': typeof CommandSimulationRoute
   '/command/users': typeof CommandUsersRoute
+  '/responder/application-pending': typeof ResponderApplicationPendingRoute
   '/responder/field-map': typeof ResponderFieldMapRoute
   '/responder/overview': typeof ResponderOverviewRoute
   '/responder/status': typeof ResponderStatusRoute
@@ -255,6 +265,7 @@ export interface FileRouteTypes {
     | '/command/overview'
     | '/command/simulation'
     | '/command/users'
+    | '/responder/application-pending'
     | '/responder/field-map'
     | '/responder/overview'
     | '/responder/status'
@@ -281,6 +292,7 @@ export interface FileRouteTypes {
     | '/command/overview'
     | '/command/simulation'
     | '/command/users'
+    | '/responder/application-pending'
     | '/responder/field-map'
     | '/responder/overview'
     | '/responder/status'
@@ -307,6 +319,7 @@ export interface FileRouteTypes {
     | '/command/overview'
     | '/command/simulation'
     | '/command/users'
+    | '/responder/application-pending'
     | '/responder/field-map'
     | '/responder/overview'
     | '/responder/status'
@@ -334,6 +347,7 @@ export interface RootRouteChildren {
   CommandOverviewRoute: typeof CommandOverviewRoute
   CommandSimulationRoute: typeof CommandSimulationRoute
   CommandUsersRoute: typeof CommandUsersRoute
+  ResponderApplicationPendingRoute: typeof ResponderApplicationPendingRoute
   ResponderFieldMapRoute: typeof ResponderFieldMapRoute
   ResponderOverviewRoute: typeof ResponderOverviewRoute
   ResponderStatusRoute: typeof ResponderStatusRoute
@@ -485,6 +499,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ResponderIndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/responder/application-pending': {
+      id: '/responder/application-pending'
+      path: '/responder/application-pending'
+      fullPath: '/responder/application-pending'
+      preLoaderRoute: typeof ResponderApplicationPendingRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/responder/field-map': {
       id: '/responder/field-map'
       path: '/responder/field-map'
@@ -534,6 +555,7 @@ const rootRouteChildren: RootRouteChildren = {
   CommandOverviewRoute: CommandOverviewRoute,
   CommandSimulationRoute: CommandSimulationRoute,
   CommandUsersRoute: CommandUsersRoute,
+  ResponderApplicationPendingRoute: ResponderApplicationPendingRoute,
   ResponderFieldMapRoute: ResponderFieldMapRoute,
   ResponderOverviewRoute: ResponderOverviewRoute,
   ResponderStatusRoute: ResponderStatusRoute,

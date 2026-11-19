@@ -7,25 +7,35 @@ import {
   Timestamp,
 } from "firebase/firestore";
 import type { User } from "firebase/auth";
-import { db } from "./firebase";
+import { auth, db } from "./firebase";
 import type {
   UserProfile,
   UserRole,
   ResponderSubtype,
   ApprovalStatus,
+  UserCapability,
+  CitizenEnrollmentStatus,
+  ResponderApplicationStatus,
+  RegistrationPath,
 } from "./auth-types";
+import { normalizeUserProfile } from "./user-normalization";
 
 /**
  * Creates an in-memory fallback user profile when Firestore is unreachable or not yet created.
  */
 export function createFallbackProfile(user: User): UserProfile {
-  return {
+  return normalizeUserProfile({
     uid: user.uid,
     displayName: user.displayName || user.email?.split("@")[0] || "User",
     email: user.email || "",
     photoURL: user.photoURL || null,
 
     role: "CITIZEN",
+    capabilities: ["CITIZEN"],
+    citizenEnrollmentStatus: "ACTIVE",
+    responderApplicationStatus: "NOT_APPLIED",
+    registrationPath: "CITIZEN",
+
     responderSubtype: null,
     commandLevel: null,
 
@@ -37,17 +47,18 @@ export function createFallbackProfile(user: User): UserProfile {
     phoneNumber: user.phoneNumber || null,
     phoneVerified: false,
 
-    emailVerified: user.emailVerified,
+    emailVerified: Boolean(user.emailVerified),
     accountStatus: "ACTIVE",
 
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     lastLoginAt: new Date().toISOString(),
-  };
+  });
 }
 
 /**
  * Fetch a user profile from Firestore `users/{uid}`.
+ * Strictly implements PURE read-time normalization with ZERO database side-effects.
  */
 export async function getUserProfile(uid: string): Promise<UserProfile | null> {
   if (!db) return null;
@@ -55,7 +66,7 @@ export async function getUserProfile(uid: string): Promise<UserProfile | null> {
     const docRef = doc(db, "users", uid);
     const snap = await getDoc(docRef);
     if (!snap.exists()) return null;
-    return snap.data() as UserProfile;
+    return normalizeUserProfile(snap.data() as Record<string, any>);
   } catch (error) {
     console.warn("Firestore getUserProfile error (database might not be created yet):", error);
     return null;
@@ -65,9 +76,9 @@ export async function getUserProfile(uid: string): Promise<UserProfile | null> {
 /**
  * Create an initial profile for a newly registered email/password user.
  * Strictly enforces that:
- * - Citizen gets role CITIZEN and approval NOT_REQUIRED.
- * - Responder gets safe base role CITIZEN with requestedRole RESPONDER,
- *   requestedResponderSubtype, and approvalStatus PENDING.
+ * - Citizen gets role CITIZEN, registrationPath CITIZEN, citizenEnrollmentStatus ACTIVE, and capabilities ["CITIZEN"].
+ * - Responder gets safe base role CITIZEN, registrationPath RESPONDER, citizenEnrollmentStatus INACTIVE,
+ *   capabilities [], requestedRole RESPONDER, and approvalStatus PENDING.
  * - Command is NEVER publicly self-registered.
  */
 export async function createInitialUserProfile(
@@ -88,6 +99,11 @@ export async function createInitialUserProfile(
     photoURL: user.photoURL || null,
 
     role: "CITIZEN",
+    capabilities: isResponder ? [] : ["CITIZEN"],
+    citizenEnrollmentStatus: isResponder ? "INACTIVE" : "ACTIVE",
+    responderApplicationStatus: isResponder ? "PENDING" : "NOT_APPLIED",
+    registrationPath: isResponder ? "RESPONDER" : "CITIZEN",
+
     responderSubtype: null,
     commandLevel: null,
 
@@ -96,10 +112,14 @@ export async function createInitialUserProfile(
 
     approvalStatus: (isResponder ? "PENDING" : "NOT_REQUIRED") as ApprovalStatus,
 
+    dutyStatus: isResponder ? undefined : undefined,
+    activeIncidentId: null,
+
     phoneNumber: params.phoneNumber || null,
     phoneVerified: false,
 
     emailVerified: user.emailVerified,
+    emailVerifiedAt: user.emailVerified ? Timestamp.now() : null,
     accountStatus: "ACTIVE",
 
     createdAt: Timestamp.now(),
@@ -189,17 +209,108 @@ export async function syncGoogleUserProfile(user: User): Promise<UserProfile> {
 }
 
 /**
+ * Synchronize email verification state from Firebase Auth to Firestore profile mirror.
+ * Strictly verifies the 6-step invariant:
+ * 1. user.reload() completes.
+ * 2. getIdToken(true) completes (force token refresh so email_verified claim is updated in JWT).
+ * 3. Refreshed Auth state is read.
+ * 4. Firestore mirror update uses authenticated user's own UID.
+ * 5. Firestore Security Rules permit transition via request.auth.token.email_verified == true.
+ * 6. Final profile is read back and confirmed.
+ */
+export async function syncEmailVerificationMirror(currentUser: User): Promise<UserProfile | null> {
+  if (!db || !auth) return null;
+  if (!currentUser || currentUser.uid !== auth.currentUser?.uid) return null;
+
+  try {
+    // 0. Check if existing profile mirror is already synchronized
+    const existing = await getUserProfile(currentUser.uid);
+    if (existing && existing.emailVerified) {
+      return existing;
+    }
+
+    // 1. user.reload() completes to refresh local Auth state
+    await currentUser.reload();
+
+    if (!currentUser.emailVerified) {
+      return existing;
+    }
+
+    // 2. getIdTokenResult(true) completes to force claim refresh
+    const tokenResult = await currentUser.getIdTokenResult(true);
+    if (!tokenResult.claims.email_verified) {
+      // If refreshed token does not yet contain email_verified claim, defer write
+      return existing;
+    }
+
+    // 4. Firestore mirror update uses authenticated user's own UID
+    const docRef = doc(db, "users", currentUser.uid);
+    await updateDoc(docRef, {
+      emailVerified: true,
+      emailVerifiedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    // 6. Final profile is read back and confirmed
+    return await getUserProfile(currentUser.uid);
+  } catch (error) {
+    console.warn("Could not sync emailVerified mirror in Firestore:", error);
+    return await getUserProfile(currentUser.uid);
+  }
+}
+
+/**
  * Update emailVerified field in user profile after confirmation.
+ * Mandatory Safeguard 4:
+ * Reload the Firebase Auth user and force-refresh the ID token after verification
+ * before updating the protected Firestore mirror.
  */
 export async function updateProfileEmailVerified(uid: string): Promise<void> {
   if (!db) return;
   try {
+    if (auth?.currentUser && auth.currentUser.uid === uid) {
+      await auth.currentUser.reload();
+      await auth.currentUser.getIdToken(true);
+    }
     const docRef = doc(db, "users", uid);
     await updateDoc(docRef, {
       emailVerified: true,
+      emailVerifiedAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
   } catch (error) {
     console.warn("Could not update emailVerified in Firestore:", error);
+  }
+}
+
+/**
+ * Update non-privileged user profile settings (name, phone, region, emergency contacts)
+ */
+export async function updateUserPreferences(
+  uid: string,
+  params: {
+    displayName?: string;
+    phoneNumber?: string;
+    region?: string;
+    language?: string;
+    emergencyContacts?: string;
+  },
+): Promise<void> {
+  const allowedUpdates: Record<string, unknown> = {
+    updatedAt: new Date().toISOString(),
+  };
+  if (params.displayName !== undefined) allowedUpdates.displayName = params.displayName;
+  if (params.phoneNumber !== undefined) allowedUpdates.phoneNumber = params.phoneNumber;
+  if (params.region !== undefined) allowedUpdates.region = params.region;
+  if (params.language !== undefined) allowedUpdates.language = params.language;
+  if (params.emergencyContacts !== undefined) allowedUpdates.emergencyContacts = params.emergencyContacts;
+
+  if (db && typeof navigator !== "undefined" && navigator.onLine) {
+    try {
+      const docRef = doc(db, "users", uid);
+      await updateDoc(docRef, allowedUpdates);
+    } catch (err) {
+      console.warn("Firestore updateUserPreferences fallback:", err);
+    }
   }
 }

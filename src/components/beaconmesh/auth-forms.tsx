@@ -24,12 +24,13 @@ import {
   formatAuthError,
 } from "@/lib/auth-service";
 import { getUserProfile, createFallbackProfile } from "@/lib/user-service";
-import { useAuth } from "@/lib/auth-context";
+import { useAuth, evaluateRoleAuthorization } from "@/lib/auth-context";
 import {
   type UserRole,
   type ResponderSubtype,
   type UserProfile,
   WORKSPACE_ROUTES,
+  PENDING_RESPONDER_ROUTE,
 } from "@/lib/auth-types";
 
 function GoogleIcon() {
@@ -60,7 +61,15 @@ function GoogleIcon() {
 // ==========================================
 export function LoginForm() {
   const navigate = useNavigate();
-  const { isConfigured, refreshProfile, user: currentUser, profile: currentProfile, signOut } = useAuth();
+  const {
+    isConfigured,
+    refreshProfile,
+    user: currentUser,
+    profile: currentProfile,
+    sessionRole,
+    setSessionRole,
+    signOut,
+  } = useAuth();
 
   const searchParams = useRouterState({
     select: (s) => new URLSearchParams(s.location.search),
@@ -88,8 +97,13 @@ export function LoginForm() {
   // ONLY render the "Already Signed In" screen if the user manually navigated to /login
   // with an existing session (NOT during an in-flight login action)
   if (initialUser && currentUser && loginState === "idle") {
+    const isPendingResponder =
+      currentProfile?.requestedRole === "RESPONDER" &&
+      currentProfile?.approvalStatus === "PENDING";
     const userRole = currentProfile?.role || "CITIZEN";
-    const dest = WORKSPACE_ROUTES[userRole];
+    const dest = isPendingResponder
+      ? PENDING_RESPONDER_ROUTE
+      : WORKSPACE_ROUTES[userRole];
     return (
       <div className="space-y-6">
         <div className="rounded-lg border border-border bg-card p-6 text-center space-y-4 shadow-sm">
@@ -99,7 +113,8 @@ export function LoginForm() {
               Already Signed In
             </h3>
             <p className="text-xs text-muted-foreground">
-              You are currently signed in as <strong>{currentUser.email || currentProfile?.displayName || "User"}</strong> ({userRole}).
+              You are currently signed in as <strong>{currentUser.email || currentProfile?.displayName || "User"}</strong>{" "}
+              ({isPendingResponder ? "Responder Applicant (Pending Review)" : userRole}).
             </p>
           </div>
           <div className="flex flex-col gap-2 pt-2">
@@ -108,7 +123,11 @@ export function LoginForm() {
               className="w-full bg-signal hover:bg-signal/90 text-white font-medium"
               onClick={() => void navigate({ to: dest })}
             >
-              Continue to {userRole} Workspace <ArrowRight className="ml-1.5 h-4 w-4" />
+              {isPendingResponder ? (
+                <>View Application Status <ArrowRight className="ml-1.5 h-4 w-4" /></>
+              ) : (
+                <>Continue to {userRole} Workspace <ArrowRight className="ml-1.5 h-4 w-4" /></>
+              )}
             </Button>
             <Button
               type="button"
@@ -173,27 +192,30 @@ export function LoginForm() {
 
       await refreshProfile();
 
-      // Verify intended workspace against the assigned role
-      if (profile.role !== intendedWorkspace) {
-        setRoleMismatch({
-          actualRole: profile.role,
-          profile,
-        });
-        setLoading(false);
-        setLoginState("idle");
-        return;
-      }
+      // Canonical authorization evaluation for selected intendedWorkspace
+      const authEval = evaluateRoleAuthorization(profile, intendedWorkspace);
 
-      // Check operational responder approval
-      if (profile.role === "RESPONDER" && profile.approvalStatus === "PENDING") {
+      if (authEval.isPending) {
+        setSessionRole("RESPONDER");
         setLoginState("redirecting");
-        void navigate({ to: "/responder/overview" });
+        void navigate({ to: PENDING_RESPONDER_ROUTE });
         return;
       }
 
-      // Role and workspace matched! Navigate to workspace destination
-      let destination = WORKSPACE_ROUTES[profile.role];
-      if (redirectParam && redirectParam.startsWith(`/${profile.role.toLowerCase()}`)) {
+      if (!authEval.isAuthorized) {
+        setError(
+          authEval.errorMessage ||
+            "You do not have access to this dashboard. Please select an authorized role or contact your administrator.",
+        );
+        setLoading(false);
+        setLoginState("error");
+        return;
+      }
+
+      // Validated! Persist session role and navigate to target dashboard
+      setSessionRole(intendedWorkspace);
+      let destination = authEval.destinationRoute || WORKSPACE_ROUTES[intendedWorkspace];
+      if (redirectParam && redirectParam.startsWith(`/${intendedWorkspace.toLowerCase()}`)) {
         destination = redirectParam;
       }
       setLoginState("redirecting");
@@ -208,7 +230,6 @@ export function LoginForm() {
 
   const handleGoogleSignIn = async () => {
     setError(null);
-    setRoleMismatch(null);
     setUnverifiedEmail(null);
 
     if (!isConfigured) {
@@ -233,19 +254,29 @@ export function LoginForm() {
       setLoginState("loading-profile");
       await refreshProfile();
 
-      // Check role mismatch against chosen workspace
-      if (profile.role !== intendedWorkspace) {
-        setRoleMismatch({
-          actualRole: profile.role,
-          profile,
-        });
-        setLoading(false);
-        setLoginState("idle");
+      // Canonical authorization evaluation for selected intendedWorkspace
+      const authEval = evaluateRoleAuthorization(profile, intendedWorkspace);
+
+      if (authEval.isPending) {
+        setSessionRole("RESPONDER");
+        setLoginState("redirecting");
+        void navigate({ to: PENDING_RESPONDER_ROUTE });
         return;
       }
 
-      let destination = WORKSPACE_ROUTES[profile.role];
-      if (redirectParam && redirectParam.startsWith(`/${profile.role.toLowerCase()}`)) {
+      if (!authEval.isAuthorized) {
+        setError(
+          authEval.errorMessage ||
+            "You do not have access to this dashboard. Please select an authorized role or contact your administrator.",
+        );
+        setLoading(false);
+        setLoginState("error");
+        return;
+      }
+
+      setSessionRole(intendedWorkspace);
+      let destination = authEval.destinationRoute || WORKSPACE_ROUTES[intendedWorkspace];
+      if (redirectParam && redirectParam.startsWith(`/${intendedWorkspace.toLowerCase()}`)) {
         destination = redirectParam;
       }
       setLoginState("redirecting");
@@ -280,6 +311,7 @@ export function LoginForm() {
               onClick={() => {
                 setIntendedWorkspace(role);
                 setRoleMismatch(null);
+                setError(null);
               }}
               className={`flex min-h-11 items-center justify-center gap-1.5 rounded-md border px-2 py-2 text-xs font-semibold transition-all ${
                 intendedWorkspace === role
@@ -987,7 +1019,15 @@ export function VerifyEmailForm() {
   }
 
   if (verificationSuccess) {
-    const destination = profile ? WORKSPACE_ROUTES[profile.role] : "/citizen/home";
+    const isPendingResponder =
+      profile?.requestedRole === "RESPONDER" &&
+      profile?.approvalStatus === "PENDING";
+    const destination = isPendingResponder
+      ? PENDING_RESPONDER_ROUTE
+      : profile
+        ? WORKSPACE_ROUTES[profile.role]
+        : "/citizen/home";
+
     return (
       <div className="space-y-5 py-4">
         <div className="rounded-lg border border-safe/30 bg-safe/10 p-6 text-center space-y-3">
@@ -996,7 +1036,9 @@ export function VerifyEmailForm() {
             Email Verified Successfully!
           </h2>
           <p className="text-sm text-foreground leading-relaxed">
-            Your BeaconMesh account is now verified and active. You have full access to your designated workspace.
+            {isPendingResponder
+              ? "Your email address has been verified. Your application for the Responder team is now awaiting review and operational credential clearance by Command."
+              : "Your BeaconMesh account is now verified and active. You have full access to your designated workspace."}
           </p>
         </div>
 
@@ -1007,7 +1049,11 @@ export function VerifyEmailForm() {
           }}
           className="w-full bg-signal hover:bg-signal/90 text-white font-medium"
         >
-          Continue to workspace <ArrowRight className="ml-2 h-4 w-4" />
+          {isPendingResponder ? (
+            <>View Application Status <ArrowRight className="ml-2 h-4 w-4" /></>
+          ) : (
+            <>Continue to workspace <ArrowRight className="ml-2 h-4 w-4" /></>
+          )}
         </Button>
       </div>
     );

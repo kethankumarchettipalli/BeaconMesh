@@ -2,6 +2,21 @@ import type { Timestamp } from "firebase/firestore";
 
 export type UserRole = "CITIZEN" | "RESPONDER" | "COMMAND";
 
+export type UserCapability = "CITIZEN" | "RESPONDER";
+
+export type CitizenEnrollmentStatus = "ACTIVE" | "INACTIVE" | "REVOKED";
+
+export type ResponderApplicationStatus = "NOT_APPLIED" | "PENDING" | "APPROVED" | "REJECTED";
+
+export type RegistrationPath = "CITIZEN" | "RESPONDER";
+
+export type ResponderDutyStatus =
+  | "OFF_DUTY"
+  | "AVAILABLE"
+  | "DISPATCHED"
+  | "ON_SCENE"
+  | "UNAVAILABLE";
+
 export type ResponderSubtype = "PROFESSIONAL" | "VOLUNTEER" | null;
 
 export type CommandLevel = "COORDINATOR" | "ADMINISTRATOR" | null;
@@ -17,6 +32,11 @@ export interface UserProfile {
   photoURL?: string | null;
 
   role: UserRole;
+  capabilities: UserCapability[];
+  citizenEnrollmentStatus: CitizenEnrollmentStatus;
+  responderApplicationStatus: ResponderApplicationStatus;
+  registrationPath: RegistrationPath;
+
   responderSubtype: ResponderSubtype;
   commandLevel: CommandLevel;
 
@@ -24,12 +44,21 @@ export interface UserProfile {
   requestedResponderSubtype?: "PROFESSIONAL" | "VOLUNTEER" | null;
 
   approvalStatus: ApprovalStatus;
+  migrationStatus?: string;
+
+  dutyStatus?: ResponderDutyStatus;
+  activeIncidentId?: string | null;
 
   phoneNumber?: string | null;
-  phoneVerified: false;
+  phoneVerified: boolean;
 
   emailVerified: boolean;
+  emailVerifiedAt?: Timestamp | string | null;
   accountStatus: AccountStatus;
+
+  reviewedBy?: string | null;
+  reviewedAt?: Timestamp | string | null;
+  rejectionReason?: string | null;
 
   createdAt: Timestamp | string;
   updatedAt: Timestamp | string;
@@ -37,26 +66,17 @@ export interface UserProfile {
 }
 
 export type AuthStateStatus =
-  | "initializing"
-  | "unauthenticated"
-  | "authenticating"
-  | "authenticated"
-  | "loading-profile"
-  | "redirecting"
-  | "error"
-  | "authorized"
-  | "email-unverified"
-  | "pending-approval"
-  | "suspended"
   | "INITIALIZING"
   | "UNAUTHENTICATED"
+  | "AUTHENTICATING"
   | "AUTHENTICATED"
-  | "EMAIL_UNVERIFIED"
   | "PROFILE_LOADING"
+  | "EMAIL_UNVERIFIED"
+  | "RESPONDER_PENDING"
   | "AUTHORIZED"
-  | "PENDING_APPROVAL"
   | "UNAUTHORIZED"
-  | "SUSPENDED";
+  | "SUSPENDED"
+  | "PROFILE_ERROR";
 
 export interface SignupData {
   fullName: string;
@@ -80,3 +100,14 @@ export const WORKSPACE_ROUTES: Record<UserRole, string> = {
   RESPONDER: "/responder/overview",
   COMMAND: "/command/overview",
 };
+
+export const PENDING_RESPONDER_ROUTE = "/responder/application-pending";
+
+export const SESSION_ROLE_KEY = "beaconmesh-session-role";
+
+export interface RoleAuthorizationResult {
+  isAuthorized: boolean;
+  isPending: boolean;
+  destinationRoute: string | null;
+  errorMessage: string | null;
+}

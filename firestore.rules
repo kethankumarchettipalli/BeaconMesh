@@ -1,7 +1,7 @@
 rules_version = '2';
 
 // ===============================================================
-// Assumed Data Model
+// Assumed Data Model (BeaconMesh v2.1 Dual Capability Architecture)
 // ===============================================================
 //
 // Collection: users
@@ -11,19 +11,56 @@ rules_version = '2';
 //   - displayName: string (required, 1-100 chars) - User's full or display name
 //   - email: string (required, valid email format, 1-254 chars, immutable on self-update) - Registered email
 //   - photoURL: string or null (optional, valid URL, max 2048 chars) - Avatar image URL
-//   - role: string (required, 'CITIZEN' | 'RESPONDER' | 'COMMAND', self-service restricted to 'CITIZEN') - Access tier
+//   - role: string (required, 'CITIZEN' | 'RESPONDER' | 'COMMAND', self-service restricted to 'CITIZEN') - Baseline access tier
 //   - responderSubtype: string or null (optional, 'PROFESSIONAL' | 'VOLUNTEER' | null) - Field responder classification
 //   - commandLevel: string or null (optional, 'COORDINATOR' | 'ADMINISTRATOR' | null) - Command tier classification
 //   - requestedRole: string or null (optional, 'RESPONDER' | null) - Pending elevated role request
 //   - requestedResponderSubtype: string or null (optional, 'PROFESSIONAL' | 'VOLUNTEER' | null) - Requested responder tier
 //   - approvalStatus: string (required, 'NOT_REQUIRED' | 'PENDING' | 'APPROVED' | 'REJECTED') - Vetting status
+//   - reviewedBy: string or null (optional, max 128 chars) - UID of Coordinator or Administrator who reviewed application
+//   - reviewedAt: timestamp or null (optional) - Timestamp when vetting decision was recorded
+//   - rejectionReason: string or null (optional, max 500 chars) - Reason provided if application was rejected
+//   - approvedBy: string or null (optional, max 128 chars) - UID of reviewer approving responder status
+//   - approvedAt: timestamp or null (optional) - Timestamp when responder approval was granted
 //   - phoneNumber: string or null (optional, max 30 chars) - Contact telephone number
 //   - phoneVerified: bool (required, must be false on creation, immutable on self-update) - SMS verification status
 //   - emailVerified: bool (required, only authenticatable via auth token verification) - Email confirmation flag
+//   - emailVerifiedAt: timestamp or null (optional) - Timestamp when email was verified
 //   - accountStatus: string (required, 'ACTIVE' | 'SUSPENDED') - Account administrative standing
 //   - createdAt: timestamp (required, immutable) - Document creation timestamp
 //   - updatedAt: timestamp (required) - Last modification timestamp
 //   - lastLoginAt: timestamp or null (optional) - Last session activity timestamp
+//   - capabilities: list of strings (optional/v2.1, subset of ['CITIZEN', 'RESPONDER'], max 2 items) - Granted capabilities
+//   - citizenEnrollmentStatus: string (optional/v2.1, 'ACTIVE' | 'INACTIVE' | 'REVOKED') - Citizen access capability
+//   - responderApplicationStatus: string (optional/v2.1, 'NOT_APPLIED' | 'PENDING' | 'APPROVED' | 'REJECTED') - Application lifecycle state
+//   - registrationPath: string (optional/v2.1, 'CITIZEN' | 'RESPONDER') - Registration route chosen at signup
+//   - dutyStatus: string or null (optional/v2.1, 'OFF_DUTY' | 'AVAILABLE' | 'DISPATCHED' | 'ON_SCENE' | 'UNAVAILABLE') - Operational responder status
+//   - activeIncidentId: string or null (optional/v2.1, max 64 chars) - Current incident dispatch assignment
+//
+// Collection: responderLocations
+// Document ID: {uid} (Matches Responder UID)
+// Fields:
+//   - uid: string (required, 1-128 chars)
+//   - latitude: number (required, -90 to 90)
+//   - longitude: number (required, -180 to 180)
+//   - dutyStatus: string (required, synced to user's dutyStatus)
+//   - activeIncidentId: string or null (required, synced to user's activeIncidentId)
+//   - updatedAt: timestamp (required)
+//
+// Collection: responderProfiles
+// Document ID: {uid} (Matches Responder UID)
+// Fields:
+//   - uid, certifications, skills, equipment, notes, updatedAt
+//
+// Collection: safezones
+// Document ID: {safezoneId}
+// Fields:
+//   - id, name, location, capacity, status, updatedAt
+//
+// Collection: incidentAssignments
+// Document ID: {assignmentId}
+// Fields:
+//   - id, incidentId, responderId, status, assignedBy, assignedAt, updatedAt
 //
 // Collection: incidents
 // Document ID: {incidentId}
@@ -158,15 +195,20 @@ service cloud.firestore {
     // Domain Validators: Users Collection
     // ===============================================================
 
-    // Full domain validator for users collection schema and limits
+    // Full domain validator for users collection schema, capabilities, and limits
     function isValidUserProfile(data) {
       return hasOnlyAllowedFields(data, [
                'uid', 'displayName', 'email', 'photoURL',
                'role', 'responderSubtype', 'commandLevel',
                'requestedRole', 'requestedResponderSubtype',
-               'approvalStatus', 'phoneNumber', 'phoneVerified',
-               'emailVerified', 'accountStatus', 'createdAt',
-               'updatedAt', 'lastLoginAt'
+               'approvalStatus', 'reviewedBy', 'reviewedAt', 'rejectionReason',
+               'approvedBy', 'approvedAt',
+               'phoneNumber', 'phoneVerified',
+               'emailVerified', 'emailVerifiedAt', 'accountStatus', 'createdAt',
+               'updatedAt', 'lastLoginAt',
+               'capabilities', 'citizenEnrollmentStatus',
+               'responderApplicationStatus', 'registrationPath',
+               'dutyStatus', 'activeIncidentId'
              ]) &&
              hasRequiredFields(data, [
                'uid', 'displayName', 'email',
@@ -190,20 +232,39 @@ service cloud.firestore {
              (!('requestedRole' in data) || data.requestedRole == null || data.requestedRole == 'RESPONDER') &&
              (!('requestedResponderSubtype' in data) || data.requestedResponderSubtype == null || data.requestedResponderSubtype in ['PROFESSIONAL', 'VOLUNTEER']) &&
              data.approvalStatus in ['NOT_REQUIRED', 'PENDING', 'APPROVED', 'REJECTED'] &&
+             (!('reviewedBy' in data) || data.reviewedBy == null || (data.reviewedBy is string && data.reviewedBy.size() <= 128)) &&
+             (!('reviewedAt' in data) || data.reviewedAt == null || data.reviewedAt is timestamp) &&
+             (!('rejectionReason' in data) || data.rejectionReason == null || (data.rejectionReason is string && data.rejectionReason.size() <= 500)) &&
+             (!('approvedBy' in data) || data.approvedBy == null || (data.approvedBy is string && data.approvedBy.size() <= 128)) &&
+             (!('approvedAt' in data) || data.approvedAt == null || data.approvedAt is timestamp) &&
              (!('phoneNumber' in data) || data.phoneNumber == null || (data.phoneNumber is string && data.phoneNumber.size() <= 30)) &&
              data.phoneVerified is bool &&
              data.emailVerified is bool &&
+             (!('emailVerifiedAt' in data) || data.emailVerifiedAt == null || data.emailVerifiedAt is timestamp) &&
              data.accountStatus in ['ACTIVE', 'SUSPENDED'] &&
              data.createdAt is timestamp &&
              data.updatedAt is timestamp &&
-             (!('lastLoginAt' in data) || data.lastLoginAt == null || data.lastLoginAt is timestamp);
+             (!('lastLoginAt' in data) || data.lastLoginAt == null || data.lastLoginAt is timestamp) &&
+             // v2.1 Dual Capability Fields Validation
+             (!('capabilities' in data) || (
+               data.capabilities is list &&
+               data.capabilities.size() <= 3 &&
+               data.capabilities.hasOnly(['CITIZEN', 'RESPONDER', 'COMMAND'])
+             )) &&
+             (!('citizenEnrollmentStatus' in data) || data.citizenEnrollmentStatus in ['ACTIVE', 'INACTIVE', 'REVOKED']) &&
+             (!('responderApplicationStatus' in data) || data.responderApplicationStatus in ['NOT_APPLIED', 'PENDING', 'APPROVED', 'REJECTED']) &&
+             (!('registrationPath' in data) || data.registrationPath in ['CITIZEN', 'RESPONDER']) &&
+             (!('dutyStatus' in data) || data.dutyStatus == null || data.dutyStatus in ['OFF_DUTY', 'AVAILABLE', 'DISPATCHED', 'ON_SCENE', 'UNAVAILABLE']) &&
+             (!('activeIncidentId' in data) || data.activeIncidentId == null || (data.activeIncidentId is string && data.activeIncidentId.size() <= 64));
     }
 
     // Enforce hierarchical consistency between role, responderSubtype, and commandLevel
     function hasValidRoleStructure(data) {
-      return (data.role == 'CITIZEN' && data.responderSubtype == null && data.commandLevel == null) ||
-             (data.role == 'RESPONDER' && data.commandLevel == null && (data.responderSubtype == null || data.responderSubtype in ['PROFESSIONAL', 'VOLUNTEER'])) ||
-             (data.role == 'COMMAND' && data.responderSubtype == null && data.commandLevel in ['COORDINATOR', 'ADMINISTRATOR']);
+      let noSubtype = !('responderSubtype' in data) || data.responderSubtype == null;
+      let noCommandLevel = !('commandLevel' in data) || data.commandLevel == null;
+      return (data.role == 'CITIZEN' && noSubtype && noCommandLevel) ||
+             (data.role == 'RESPONDER' && noCommandLevel && (noSubtype || data.responderSubtype in ['PROFESSIONAL', 'VOLUNTEER'])) ||
+             (data.role == 'COMMAND' && noSubtype && ('commandLevel' in data && data.commandLevel in ['COORDINATOR', 'ADMINISTRATOR']));
     }
 
     // Rules for user profile registration (create)
@@ -224,6 +285,19 @@ service cloud.firestore {
              // Responder application validation
              ((d.requestedRole == 'RESPONDER' && d.approvalStatus == 'PENDING' && d.requestedResponderSubtype in ['PROFESSIONAL', 'VOLUNTEER']) ||
               (d.requestedRole == null && d.approvalStatus == 'NOT_REQUIRED' && d.requestedResponderSubtype == null)) &&
+             // v2.1 Dual Capability Registration Paths
+             (!('registrationPath' in d) ||
+              (d.registrationPath == 'CITIZEN' &&
+               d.capabilities == ['CITIZEN'] &&
+               d.citizenEnrollmentStatus == 'ACTIVE' &&
+               d.responderApplicationStatus == 'NOT_APPLIED' &&
+               d.role == 'CITIZEN') ||
+              (d.registrationPath == 'RESPONDER' &&
+               d.capabilities.size() == 0 &&
+               d.citizenEnrollmentStatus == 'INACTIVE' &&
+               d.responderApplicationStatus == 'PENDING' &&
+               d.requestedRole == 'RESPONDER' &&
+               d.role == 'CITIZEN')) &&
              // Initial status requirements
              d.accountStatus == 'ACTIVE' &&
              d.phoneVerified == false &&
@@ -234,10 +308,14 @@ service cloud.firestore {
 
     // Rules for self-update of user profile
     function isValidUserSelfUpdate(uid) {
+      let diff = request.resource.data.diff(resource.data).affectedKeys();
       let d = request.resource.data;
       let prev = resource.data;
-      return isValidUserProfile(d) &&
-             hasValidRoleStructure(d) &&
+      // Fast-fail early on affectedKeys and account status
+      return diff.hasOnly([
+               'displayName', 'phoneNumber', 'photoURL', 'updatedAt', 'lastLoginAt',
+               'emailVerified', 'emailVerifiedAt', 'dutyStatus'
+             ]) &&
              // Suspended users cannot update anything
              prev.accountStatus == 'ACTIVE' &&
              // Immutable core identifiers
@@ -245,50 +323,179 @@ service cloud.firestore {
              d.uid == prev.uid &&
              d.createdAt == prev.createdAt &&
              d.email == prev.email &&
-             // Self-escalation prevention: privilege fields CANNOT be modified by the user
+             // Self-escalation prevention: privilege, capability, and assignment fields CANNOT be modified by the user
              d.role == prev.role &&
-             d.responderSubtype == prev.responderSubtype &&
-             d.commandLevel == prev.commandLevel &&
              d.approvalStatus == prev.approvalStatus &&
              d.accountStatus == prev.accountStatus &&
              d.phoneVerified == prev.phoneVerified &&
-             d.requestedRole == prev.requestedRole &&
-             d.requestedResponderSubtype == prev.requestedResponderSubtype &&
-             // Diff restriction: only non-privileged profile fields may be edited
-             request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-               'displayName', 'phoneNumber', 'photoURL', 'updatedAt', 'lastLoginAt', 'emailVerified'
-             ]) &&
-             // emailVerified can only be toggled true if confirmed by Firebase Auth token
-             (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['emailVerified']) ||
+             (!('commandLevel' in prev) ? !('commandLevel' in d) : d.commandLevel == prev.commandLevel) &&
+             (!('responderSubtype' in prev) ? !('responderSubtype' in d) : d.responderSubtype == prev.responderSubtype) &&
+             (!('requestedRole' in prev) ? !('requestedRole' in d) : d.requestedRole == prev.requestedRole) &&
+             (!('requestedResponderSubtype' in prev) ? !('requestedResponderSubtype' in d) : d.requestedResponderSubtype == prev.requestedResponderSubtype) &&
+             // v2.1 Invariant Locks for self-updates
+             (!('capabilities' in prev) || d.capabilities == prev.capabilities) &&
+             (!('citizenEnrollmentStatus' in prev) || d.citizenEnrollmentStatus == prev.citizenEnrollmentStatus) &&
+             (!('responderApplicationStatus' in prev) || d.responderApplicationStatus == prev.responderApplicationStatus) &&
+             (!('registrationPath' in prev) || d.registrationPath == prev.registrationPath) &&
+             (!('activeIncidentId' in prev) || d.activeIncidentId == prev.activeIncidentId) &&
+             (!('reviewedBy' in prev) || d.reviewedBy == prev.reviewedBy) &&
+             (!('reviewedAt' in prev) || d.reviewedAt == prev.reviewedAt) &&
+             (!('rejectionReason' in prev) || d.rejectionReason == prev.rejectionReason) &&
+             (!('approvedBy' in prev) || d.approvedBy == prev.approvedBy) &&
+             (!('approvedAt' in prev) || d.approvedAt == prev.approvedAt) &&
+             // Safeguard 3: Assignment Integrity on dutyStatus transition
+             (!diff.hasAny(['dutyStatus']) ||
+              (('activeIncidentId' in prev && prev.activeIncidentId != null) ?
+                (d.dutyStatus != 'OFF_DUTY' && d.dutyStatus != 'AVAILABLE' && d.dutyStatus in ['DISPATCHED', 'ON_SCENE', 'UNAVAILABLE']) :
+                (d.dutyStatus in ['OFF_DUTY', 'AVAILABLE', 'UNAVAILABLE']))) &&
+             // Safeguard 4: emailVerified can only be toggled true if confirmed by Firebase Auth token
+             (!diff.hasAny(['emailVerified']) ||
               d.emailVerified == prev.emailVerified ||
               ('email_verified' in request.auth.token && request.auth.token.email_verified == true && d.emailVerified == true)) &&
+             (!diff.hasAny(['emailVerifiedAt']) ||
+              ('email_verified' in request.auth.token && request.auth.token.email_verified == true)) &&
              // Timestamp update required
+             d.updatedAt is timestamp &&
+             d.updatedAt <= request.time &&
+             isValidUserProfile(d) &&
+             hasValidRoleStructure(d);
+    }
+
+    // Architecture Decision #7 & v2.1 Dual Capability:
+    // Coordinators may approve/reject eligible verified Responder applications and grant dual capability.
+    function isValidUserCoordinatorUpdate(uid) {
+      let diff = request.resource.data.diff(resource.data).affectedKeys();
+      let d = request.resource.data;
+      let prev = resource.data;
+      // Fast-fail: restrict diff to strictly vetting and capability fields only
+      return diff.hasOnly([
+               'role', 'responderSubtype', 'approvalStatus', 'reviewedBy', 'reviewedAt',
+               'rejectionReason', 'approvedBy', 'approvedAt', 'capabilities',
+               'citizenEnrollmentStatus', 'responderApplicationStatus', 'dutyStatus',
+               'activeIncidentId', 'updatedAt'
+             ]) &&
+             diff.hasAny(['approvalStatus', 'reviewedBy', 'approvedBy', 'rejectionReason', 'capabilities', 'citizenEnrollmentStatus', 'responderApplicationStatus']) &&
+             isCommandUser() &&
+             // Eligible applicant check: must have requested RESPONDER and not be existing COMMAND
+             (prev.requestedRole == 'RESPONDER' || prev.responderApplicationStatus == 'PENDING') &&
+             prev.role != 'COMMAND' &&
+             prev.commandLevel == null &&
+             // Applicant's email must be verified
+             prev.emailVerified == true &&
+             // Invariants: immutable core fields
+             d.uid == prev.uid &&
+             d.createdAt == prev.createdAt &&
+             d.email == prev.email &&
+             // Coordinators CANNOT elevate anyone to COMMAND or set commandLevel
+             d.role in ['CITIZEN', 'RESPONDER'] &&
+             d.commandLevel == null &&
+             // Coordinators CANNOT alter accountStatus
+             d.accountStatus == prev.accountStatus &&
+             // Allowed state transitions:
+             // Approval: grants dual capability (both CITIZEN and RESPONDER)
+             ((d.approvalStatus == 'APPROVED' &&
+               d.responderApplicationStatus == 'APPROVED' &&
+               d.capabilities.hasAll(['CITIZEN', 'RESPONDER']) &&
+               d.capabilities.size() == 2 &&
+               d.citizenEnrollmentStatus == 'ACTIVE' &&
+               d.role == 'RESPONDER' &&
+               d.responderSubtype == prev.requestedResponderSubtype &&
+               d.dutyStatus == 'OFF_DUTY' &&
+               d.activeIncidentId == null) ||
+              // Rejection: preserves citizen capability if enrolled, otherwise none
+              (d.approvalStatus == 'REJECTED' &&
+               d.responderApplicationStatus == 'REJECTED' &&
+               (prev.citizenEnrollmentStatus == 'ACTIVE' ? d.capabilities == ['CITIZEN'] : d.capabilities.size() == 0) &&
+               d.role == 'CITIZEN' &&
+               d.responderSubtype == null)) &&
+             // Review metadata validation
+             (!('reviewedBy' in d) || d.reviewedBy == null || d.reviewedBy == request.auth.uid) &&
+             (!('approvedBy' in d) || d.approvedBy == null || d.approvedBy == request.auth.uid) &&
+             d.updatedAt is timestamp &&
+             d.updatedAt <= request.time &&
+             isValidUserProfile(d) &&
+             hasValidRoleStructure(d);
+    }
+
+    // Command assignment update: Command users updating approved responder dispatch assignments and dutyStatus
+    function isValidUserAssignmentUpdate(uid) {
+      let diff = request.resource.data.diff(resource.data).affectedKeys();
+      let d = request.resource.data;
+      let prev = resource.data;
+      // Fast-fail: only evaluate if diff is strictly dutyStatus, activeIncidentId, and updatedAt
+      return diff.hasOnly(['dutyStatus', 'activeIncidentId', 'updatedAt']) &&
+             isCommandUser() &&
+             // Must be an approved responder
+             (prev.role == 'RESPONDER' || ('capabilities' in prev && prev.capabilities.hasAny(['RESPONDER']))) &&
+             // Invariants: immutable core fields
+             d.uid == prev.uid &&
+             d.createdAt == prev.createdAt &&
+             d.email == prev.email &&
+             d.role == prev.role &&
+             d.commandLevel == prev.commandLevel &&
+             d.accountStatus == prev.accountStatus &&
+             d.approvalStatus == prev.approvalStatus &&
+             // Field validation for modified fields
+             (!('dutyStatus' in d) || d.dutyStatus == null || d.dutyStatus in ['OFF_DUTY', 'AVAILABLE', 'DISPATCHED', 'ON_SCENE', 'UNAVAILABLE']) &&
+             // Anti-attack hardening: Coordinators CANNOT dispatch or assign an OFF_DUTY responder
+             (!(d.dutyStatus == 'DISPATCHED') || (prev.dutyStatus != 'OFF_DUTY' && prev.dutyStatus in ['AVAILABLE', 'DISPATCHED', 'ON_SCENE'])) &&
+             (!('activeIncidentId' in d) || d.activeIncidentId == null || (d.activeIncidentId is string && d.activeIncidentId.size() <= 64)) &&
+             // If activeIncidentId is present, responder cannot be OFF_DUTY or AVAILABLE
+             (d.activeIncidentId == null || (d.dutyStatus != 'OFF_DUTY' && d.dutyStatus != 'AVAILABLE')) &&
+             // Atomic cross-document consistency with incidentAssignments:
+             (d.activeIncidentId == prev.activeIncidentId ||
+              // Assigning: must atomically create active assignment record
+              (d.activeIncidentId != null &&
+               d.dutyStatus == 'DISPATCHED' &&
+               prev.dutyStatus in ['AVAILABLE', 'DISPATCHED', 'ON_SCENE'] &&
+               existsAfter(/databases/$(database)/documents/incidentAssignments/$(d.activeIncidentId + "_" + uid)) &&
+               getAfter(/databases/$(database)/documents/incidentAssignments/$(d.activeIncidentId + "_" + uid)).data.status == 'ACTIVE' &&
+               getAfter(/databases/$(database)/documents/incidentAssignments/$(d.activeIncidentId + "_" + uid)).data.responderId == uid &&
+               getAfter(/databases/$(database)/documents/incidentAssignments/$(d.activeIncidentId + "_" + uid)).data.incidentId == d.activeIncidentId) ||
+              // Completing/clearing: must atomically update assignment record to terminal status
+              (d.activeIncidentId == null &&
+               prev.activeIncidentId != null &&
+               existsAfter(/databases/$(database)/documents/incidentAssignments/$(prev.activeIncidentId + "_" + uid)) &&
+               getAfter(/databases/$(database)/documents/incidentAssignments/$(prev.activeIncidentId + "_" + uid)).data.status in ['COMPLETED', 'CANCELLED', 'RESOLVED'])) &&
              d.updatedAt is timestamp &&
              d.updatedAt <= request.time;
     }
 
-    // Rules for administrative update of user profile
+    // Rules for administrative update of user profile (Phase 0.2 Operational State-Machine Hardening)
     function isValidUserAdminUpdate(uid) {
+      let diff = request.resource.data.diff(resource.data).affectedKeys();
       let d = request.resource.data;
       let prev = resource.data;
-      return isAdministrator() &&
-             isValidUserProfile(d) &&
-             hasValidRoleStructure(d) &&
+      // Fast-fail: restrict diff to strictly 5 fields: accountStatus and basic profile info
+      return diff.hasOnly(['accountStatus', 'displayName', 'phoneNumber', 'photoURL', 'updatedAt']) &&
+             isAdministrator() &&
+             // Cannot target an existing COMMAND user
+             prev.role != 'COMMAND' &&
+             prev.commandLevel == null &&
              // Immutable document invariants
              d.uid == prev.uid &&
              d.createdAt == prev.createdAt &&
-             // Administrator cannot alter their own authority standing or lock themselves out
-             (request.auth.uid != uid || (
-               d.role == prev.role &&
-               d.commandLevel == prev.commandLevel &&
-               d.accountStatus == prev.accountStatus
-             )) &&
-             // Admin allowed modification fields
-             request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-               'role', 'responderSubtype', 'commandLevel', 'approvalStatus',
-               'accountStatus', 'updatedAt', 'displayName', 'phoneNumber', 'photoURL'
-             ]) &&
-             d.updatedAt is timestamp;
+             d.email == prev.email &&
+             // Administrator cannot alter their own authority standing or suspend themselves
+             (request.auth.uid != uid || d.accountStatus == prev.accountStatus) &&
+             // Operational state-machine lockdown: generic admin updates cannot touch role, tier, vetting, or capabilities
+             d.role == prev.role &&
+             (!('commandLevel' in prev) ? !('commandLevel' in d) : d.commandLevel == prev.commandLevel) &&
+             d.approvalStatus == prev.approvalStatus &&
+             (!('responderSubtype' in prev) ? !('responderSubtype' in d) : d.responderSubtype == prev.responderSubtype) &&
+             (!('capabilities' in prev) || d.capabilities == prev.capabilities) &&
+             (!('citizenEnrollmentStatus' in prev) || d.citizenEnrollmentStatus == prev.citizenEnrollmentStatus) &&
+             (!('responderApplicationStatus' in prev) || d.responderApplicationStatus == prev.responderApplicationStatus) &&
+             (!('dutyStatus' in prev) || d.dutyStatus == prev.dutyStatus) &&
+             (!('activeIncidentId' in prev) || d.activeIncidentId == prev.activeIncidentId) &&
+             // Account status constraints
+             d.accountStatus in ['ACTIVE', 'SUSPENDED'] &&
+             // Field-specific validation for the allowed fields
+             (!('displayName' in d) || (d.displayName is string && d.displayName.size() > 0 && d.displayName.size() <= 100)) &&
+             (!('phoneNumber' in d) || d.phoneNumber == null || (d.phoneNumber is string && d.phoneNumber.size() <= 30)) &&
+             (!('photoURL' in d) || d.photoURL == null || (d.photoURL is string && d.photoURL.size() <= 2048 && isValidUrl(d.photoURL))) &&
+             d.updatedAt is timestamp &&
+             d.updatedAt <= request.time;
     }
 
     // ===============================================================
@@ -336,27 +543,25 @@ service cloud.firestore {
       let d = request.resource.data;
       let prev = resource.data;
       return isCommand() &&
-             isValidIncident(d) &&
              d.id == prev.id &&
              d.createdBy == prev.createdBy &&
              d.createdAt == prev.createdAt &&
-             d.updatedAt <= request.time;
+             d.updatedAt <= request.time &&
+             isValidIncident(d);
     }
 
     // Incident update by Approved Responders (restricted to status, notes, assignment)
     function isValidIncidentResponderUpdate() {
+      let diff = request.resource.data.diff(resource.data).affectedKeys();
       let d = request.resource.data;
       let prev = resource.data;
-      return isApprovedResponder() &&
-             isValidIncident(d) &&
+      return diff.hasOnly(['status', 'notes', 'assignedResponderId', 'updatedAt']) &&
+             isApprovedResponder() &&
              d.id == prev.id &&
              d.createdBy == prev.createdBy &&
              d.createdAt == prev.createdAt &&
-             // Responders can only modify status, notes, assigned responder, and updatedAt
-             request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-               'status', 'notes', 'assignedResponderId', 'updatedAt'
-             ]) &&
-             d.updatedAt <= request.time;
+             d.updatedAt <= request.time &&
+             isValidIncident(d);
     }
 
     // Incident update by authoring Citizen (only while report is pending dispatch)
@@ -391,12 +596,93 @@ service cloud.firestore {
       // Create: Users can register their own profile with CITIZEN role only.
       allow create: if isValidUserCreate(uid);
 
-      // Update: Self-update for non-privileged fields; Admin-update for role, status, and assignment.
+      // Update:
+      // - Self-update for non-privileged profile & operational dutyStatus
+      // - Coordinator-update for responder application vetting (dual capability granting)
+      // - Command assignment update for responder dispatch
+      // - Admin-update for administrative control
       allow update: if (isOwner(uid) && isValidUserSelfUpdate(uid)) ||
-                       isValidUserAdminUpdate(uid);
+                       (!isOwner(uid) && (
+                         isValidUserCoordinatorUpdate(uid) ||
+                         isValidUserAssignmentUpdate(uid) ||
+                         isValidUserAdminUpdate(uid)
+                       ));
 
-      // Delete: Only active Administrators can delete user profiles.
+      // Delete: Strictly disallowed for all users including Administrators.
+      // Account suspension and status management must be handled via accountStatus updates.
+      allow delete: if false;
+    }
+
+    // Responder Live Locations (Safeguard 2: Location Privacy & Deletion)
+    match /responderLocations/{uid} {
+      // Command can only read when responder is active on duty (AVAILABLE, DISPATCHED, ON_SCENE); never when OFF_DUTY
+      allow read: if isOwner(uid) ||
+                     (isCommandUser() && resource.data.dutyStatus in ['AVAILABLE', 'DISPATCHED', 'ON_SCENE']);
+
+      // Hardened write rule: Citizens, Pending Responders, and OFF_DUTY Responders cannot write location records
+      allow create, update: if isOwner(uid) &&
+                               (isApprovedResponder() || (userExists(uid) && 'capabilities' in getUserDoc(uid) && getUserDoc(uid).capabilities.hasAny(['RESPONDER']))) &&
+                               getUserDoc(uid).accountStatus == 'ACTIVE' &&
+                               getUserDoc(uid).dutyStatus in ['AVAILABLE', 'DISPATCHED', 'ON_SCENE'] &&
+                               request.resource.data.dutyStatus == getUserDoc(uid).dutyStatus &&
+                               request.resource.data.activeIncidentId == getUserDoc(uid).activeIncidentId &&
+                               request.resource.data.latitude is number &&
+                               request.resource.data.latitude >= -90 &&
+                               request.resource.data.latitude <= 90 &&
+                               request.resource.data.longitude is number &&
+                               request.resource.data.longitude >= -180 &&
+                               request.resource.data.longitude <= 180;
+
+      // Responders have full ownership rights to delete their location history/record
+      allow delete: if isOwner(uid);
+    }
+
+    // Responder Professional Profiles
+    match /responderProfiles/{uid} {
+      // Read: Document owner, active command users, or active approved responders
+      allow read: if isOwner(uid) || isCommandUser() || isApprovedResponder();
+
+      // Create: Active approved responder creating their own profile, or Administrator
+      allow create: if (isOwner(uid) && isApprovedResponder()) || isAdministrator();
+
+      // Update: Owner updating their profile, or Command staff
+      allow update: if (isOwner(uid) && isApprovedResponder()) || isCommandUser();
+
+      // Delete: Only Administrator
       allow delete: if isAdministrator();
+    }
+
+    // Safe Zones Collection (Both safezones and safeZones aliases for case-insensitive client compatibility)
+    match /safezones/{safezoneId} {
+      // Read: Active users OR any user requesting genuinely verified public emergency shelters
+      allow read: if isActiveUser() || resource.data.verificationStatus == 'VERIFIED';
+
+      // Create, Update, Delete: Managed strictly by Command staff
+      allow create, update, delete: if isCommandUser();
+    }
+
+    match /safeZones/{safezoneId} {
+      allow read: if isActiveUser() || resource.data.verificationStatus == 'VERIFIED';
+      allow create, update, delete: if isCommandUser();
+    }
+
+    // Incident Assignments Collection
+    match /incidentAssignments/{assignmentId} {
+      // Read: Assigned responder, Command users, or active incident participants
+      allow read: if isCommandUser() ||
+                     (isAuthenticated() && request.auth.uid == resource.data.responderId);
+
+      // Create: Command staff assign responders atomically alongside responder profile dispatch update
+      allow create: if isCommandUser() &&
+                       getAfter(/databases/$(database)/documents/users/$(request.resource.data.responderId)).data.activeIncidentId == request.resource.data.incidentId &&
+                       getAfter(/databases/$(database)/documents/users/$(request.resource.data.responderId)).data.dutyStatus == 'DISPATCHED';
+
+      // Update: Command staff, or assigned responder updating dispatch status
+      allow update: if isCommandUser() ||
+                       (isAuthenticated() && request.auth.uid == resource.data.responderId);
+
+      // Delete: Command staff
+      allow delete: if isCommandUser();
     }
 
     // Incidents Collection
@@ -411,8 +697,8 @@ service cloud.firestore {
       // - Active Command users can update any incident field
       // - Approved Responders can update status, notes, and assignment
       // - Citizens can only update their own pending incident report
-      allow update: if isValidIncidentCommandUpdate() ||
-                       isValidIncidentResponderUpdate() ||
+      allow update: if (isCommand() && isValidIncidentCommandUpdate()) ||
+                       (isApprovedResponder() && isValidIncidentResponderUpdate()) ||
                        isValidIncidentCitizenUpdate();
 
       // Delete: Only active Command staff can delete incident records
@@ -423,8 +709,8 @@ service cloud.firestore {
     match /reports/{reportId} {
       allow read: if isActiveUser();
       allow create: if isActiveUser() && isValidIncidentCreate();
-      allow update: if isValidIncidentCommandUpdate() ||
-                       isValidIncidentResponderUpdate() ||
+      allow update: if (isCommand() && isValidIncidentCommandUpdate()) ||
+                       (isApprovedResponder() && isValidIncidentResponderUpdate()) ||
                        isValidIncidentCitizenUpdate();
       allow delete: if isCommand();
     }

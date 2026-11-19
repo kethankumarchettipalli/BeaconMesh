@@ -9,6 +9,13 @@ export default defineConfig({
     globals: true,
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
+    fileParallelism: false,
+    css: true,
+    server: {
+      deps: {
+        inline: [/@arcgis\/core/, /@esri\/calcite-components/],
+      },
+    },
   },
   resolve: {
     alias: { "@": path.resolve(__dirname, "./src") },
