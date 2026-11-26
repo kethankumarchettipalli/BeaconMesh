@@ -1,9 +1,46 @@
-import { describe, expect, it } from "vitest";
-import { formatAuthError } from "@/lib/auth-service";
-import { createFallbackProfile } from "@/lib/user-service";
+import { describe, expect, it, vi } from "vitest";
+import React, { useEffect } from "react";
+import { render, act } from "@testing-library/react";
+import { formatAuthError, verifyAndAuthorizeGoogleUser } from "@/lib/auth-service";
+import { createFallbackProfile, isValidProfileStructure, getUserProfile, syncGoogleUserProfile } from "@/lib/user-service";
 import { normalizeUserProfile } from "@/lib/user-normalization";
-import { evaluateRoleAuthorization, isPendingResponderApplicant, } from "@/lib/auth-context";
+import { evaluateRoleAuthorization, isPendingResponderApplicant, AuthProvider, useAuth } from "@/lib/auth-context";
 import { WORKSPACE_ROUTES, PENDING_RESPONDER_ROUTE, SESSION_ROLE_KEY, } from "@/lib/auth-types";
+import { signOut, getRedirectResult } from "firebase/auth";
+
+const mockAuth = { currentUser: { uid: "test-auth-user" } };
+let authStateCallback = null;
+
+vi.mock("@/lib/firebase", () => ({
+    get auth() { return mockAuth; },
+    db: {},
+    isFirebaseConfigured: true,
+}));
+
+vi.mock("firebase/auth", async (importOriginal) => {
+    const actual = await importOriginal();
+    return {
+        ...actual,
+        signOut: vi.fn().mockImplementation(async () => {
+            mockAuth.currentUser = null;
+            if (authStateCallback) authStateCallback(null);
+        }),
+        getRedirectResult: vi.fn().mockResolvedValue(null),
+        onAuthStateChanged: vi.fn((_auth, cb) => {
+            authStateCallback = cb;
+            return vi.fn();
+        }),
+    };
+});
+
+vi.mock("@/lib/user-service", async (importOriginal) => {
+    const actual = await importOriginal();
+    return {
+        ...actual,
+        getUserProfile: vi.fn(),
+        syncGoogleUserProfile: vi.fn(),
+    };
+});
 describe("BeaconMesh Authorization Model & Roles", () => {
     it("enforces exactly three primary workspace routes", () => {
         expect(WORKSPACE_ROUTES.CITIZEN).toBe("/citizen/home");
@@ -92,17 +129,10 @@ describe("Registration & Role Provisioning Rules", () => {
         expect(fallback.accountStatus).toBe("ACTIVE");
         expect(fallback.emailVerified).toBe(true);
     });
-    it("defaults new Google accounts to CITIZEN role", () => {
-        const newGoogleProfile = {
-            role: "CITIZEN",
-            responderSubtype: null,
-            commandLevel: null,
-            approvalStatus: "NOT_REQUIRED",
-            accountStatus: "ACTIVE",
-            emailVerified: true,
-        };
-        expect(newGoogleProfile.role).toBe("CITIZEN");
-        expect(newGoogleProfile.approvalStatus).toBe("NOT_REQUIRED");
+    it("rejects unregistered Google accounts and denies self-registration", () => {
+        // Enforce that new Google accounts are NOT granted CITIZEN role or auto-registered
+        const unregisteredProfile = null;
+        expect(unregisteredProfile).toBeNull();
     });
     it("prevents overwriting assigned roles on existing Google account sync", () => {
         const existingCommander = {
@@ -734,5 +764,666 @@ describe("Part A: Capability Schema Consistency & Email Verification Mirror Test
             emailVerifiedAt: new Date().toISOString(),
         });
         expect(afterSync.emailVerified).toBe(true);
+    });
+});
+describe("Task 3: Google Sign-In Existing Accounts Only Authorization (GGL-01 - GGL-15)", () => {
+    const mockGoogleCitizenUser = {
+        uid: "google-citizen-uid-01",
+        email: "citizen@example.com",
+        displayName: "Citizen Jane",
+        photoURL: "https://example.com/jane.jpg",
+        emailVerified: true,
+    };
+
+    const validCitizenProfile = {
+        uid: "google-citizen-uid-01",
+        displayName: "Citizen Jane",
+        email: "citizen@example.com",
+        photoURL: null,
+        role: "CITIZEN",
+        capabilities: ["CITIZEN"],
+        citizenEnrollmentStatus: "ACTIVE",
+        responderApplicationStatus: "NOT_APPLIED",
+        registrationPath: "CITIZEN",
+        responderSubtype: null,
+        commandLevel: null,
+        requestedRole: null,
+        requestedResponderSubtype: null,
+        approvalStatus: "NOT_REQUIRED",
+        phoneNumber: null,
+        phoneVerified: false,
+        emailVerified: true,
+        accountStatus: "ACTIVE",
+    };
+
+    it("GGL-01: Citizen existing account allowed -> successful login, profile returned with CITIZEN role & capabilities", async () => {
+        vi.mocked(getUserProfile).mockResolvedValueOnce(validCitizenProfile);
+        vi.mocked(syncGoogleUserProfile).mockResolvedValueOnce({
+            ...validCitizenProfile,
+            lastLoginAt: "2026-11-26T12:00:00Z",
+        });
+
+        const result = await verifyAndAuthorizeGoogleUser(mockGoogleCitizenUser);
+        expect(result.user.uid).toBe("google-citizen-uid-01");
+        expect(result.profile.role).toBe("CITIZEN");
+        expect(result.profile.capabilities).toEqual(["CITIZEN"]);
+        expect(result.profile.accountStatus).toBe("ACTIVE");
+        expect(result.profile.emailVerified).toBe(true);
+    });
+
+    it("GGL-02: Responder existing account allowed -> successful login, profile returned with RESPONDER role & capabilities preserved", async () => {
+        const approvedResponder = {
+            ...validCitizenProfile,
+            uid: "google-responder-uid-02",
+            role: "RESPONDER",
+            capabilities: ["CITIZEN", "RESPONDER"],
+            approvalStatus: "APPROVED",
+            responderSubtype: "VOLUNTEER",
+        };
+        vi.mocked(getUserProfile).mockResolvedValueOnce(approvedResponder);
+        vi.mocked(syncGoogleUserProfile).mockResolvedValueOnce({
+            ...approvedResponder,
+            lastLoginAt: "2026-11-26T12:00:00Z",
+        });
+
+        const result = await verifyAndAuthorizeGoogleUser({
+            ...mockGoogleCitizenUser,
+            uid: "google-responder-uid-02",
+        });
+        expect(result.profile.role).toBe("RESPONDER");
+        expect(result.profile.capabilities).toContain("RESPONDER");
+        expect(result.profile.approvalStatus).toBe("APPROVED");
+    });
+
+    it("GGL-03: Pending responder applicant preserved -> successful login, profile returned with requestedRole RESPONDER, approvalStatus PENDING", async () => {
+        const pendingApplicant = {
+            ...validCitizenProfile,
+            uid: "google-pending-uid-03",
+            role: "CITIZEN",
+            capabilities: ["CITIZEN"],
+            requestedRole: "RESPONDER",
+            requestedResponderSubtype: "VOLUNTEER",
+            approvalStatus: "PENDING",
+            responderApplicationStatus: "PENDING",
+        };
+        vi.mocked(getUserProfile).mockResolvedValueOnce(pendingApplicant);
+        vi.mocked(syncGoogleUserProfile).mockResolvedValueOnce({
+            ...pendingApplicant,
+            lastLoginAt: "2026-11-26T12:00:00Z",
+        });
+
+        const result = await verifyAndAuthorizeGoogleUser({
+            ...mockGoogleCitizenUser,
+            uid: "google-pending-uid-03",
+        });
+        expect(result.profile.requestedRole).toBe("RESPONDER");
+        expect(result.profile.approvalStatus).toBe("PENDING");
+        expect(result.profile.role).toBe("CITIZEN");
+    });
+
+    it("GGL-04: Command Operations existing account allowed -> successful login, profile returned with COMMAND role, COORDINATOR level preserved", async () => {
+        const commandOps = {
+            ...validCitizenProfile,
+            uid: "google-cmd-ops-04",
+            role: "COMMAND",
+            commandLevel: "COORDINATOR",
+            capabilities: ["CITIZEN"],
+            approvalStatus: "APPROVED",
+        };
+        vi.mocked(getUserProfile).mockResolvedValueOnce(commandOps);
+        vi.mocked(syncGoogleUserProfile).mockResolvedValueOnce({
+            ...commandOps,
+            lastLoginAt: "2026-11-26T12:00:00Z",
+        });
+
+        const result = await verifyAndAuthorizeGoogleUser({
+            ...mockGoogleCitizenUser,
+            uid: "google-cmd-ops-04",
+        });
+        expect(result.profile.role).toBe("COMMAND");
+        expect(result.profile.commandLevel).toBe("COORDINATOR");
+    });
+
+    it("GGL-05: Command Admin existing account allowed -> successful login, profile returned with COMMAND role, ADMINISTRATOR level preserved", async () => {
+        const commandAdmin = {
+            ...validCitizenProfile,
+            uid: "google-cmd-admin-05",
+            role: "COMMAND",
+            commandLevel: "ADMINISTRATOR",
+            capabilities: ["CITIZEN"],
+            approvalStatus: "APPROVED",
+        };
+        vi.mocked(getUserProfile).mockResolvedValueOnce(commandAdmin);
+        vi.mocked(syncGoogleUserProfile).mockResolvedValueOnce({
+            ...commandAdmin,
+            lastLoginAt: "2026-11-26T12:00:00Z",
+        });
+
+        const result = await verifyAndAuthorizeGoogleUser({
+            ...mockGoogleCitizenUser,
+            uid: "google-cmd-admin-05",
+        });
+        expect(result.profile.role).toBe("COMMAND");
+        expect(result.profile.commandLevel).toBe("ADMINISTRATOR");
+    });
+
+    it("GGL-06: Suspended account denied -> throws auth/user-suspended and calls signOut", async () => {
+        const suspendedUser = {
+            ...validCitizenProfile,
+            uid: "google-suspended-06",
+            accountStatus: "SUSPENDED",
+        };
+        vi.mocked(getUserProfile).mockResolvedValueOnce(suspendedUser);
+        vi.mocked(signOut).mockClear();
+
+        await expect(
+            verifyAndAuthorizeGoogleUser({ ...mockGoogleCitizenUser, uid: "google-suspended-06" })
+        ).rejects.toMatchObject({ code: "auth/user-suspended" });
+
+        expect(signOut).toHaveBeenCalled();
+    });
+
+    it("GGL-07: Unverified account denied -> throws auth/email-unverified and calls signOut", async () => {
+        const unverifiedUser = {
+            ...validCitizenProfile,
+            uid: "google-unverified-07",
+            emailVerified: false,
+        };
+        vi.mocked(getUserProfile).mockResolvedValueOnce(unverifiedUser);
+        vi.mocked(signOut).mockClear();
+
+        await expect(
+            verifyAndAuthorizeGoogleUser({ ...mockGoogleCitizenUser, uid: "google-unverified-07" })
+        ).rejects.toMatchObject({ code: "auth/email-unverified" });
+
+        expect(signOut).toHaveBeenCalled();
+    });
+
+    it("GGL-08: Unknown/unregistered Google identity denied -> throws auth/user-not-found, calls signOut, zero writes", async () => {
+        vi.mocked(getUserProfile).mockResolvedValueOnce(null);
+        vi.mocked(syncGoogleUserProfile).mockClear();
+        vi.mocked(signOut).mockClear();
+
+        await expect(
+            verifyAndAuthorizeGoogleUser({ ...mockGoogleCitizenUser, uid: "google-unknown-08" })
+        ).rejects.toMatchObject({ code: "auth/user-not-found" });
+
+        expect(signOut).toHaveBeenCalled();
+        expect(syncGoogleUserProfile).not.toHaveBeenCalled();
+    });
+
+    it("GGL-09: Firestore lookup failure denied -> throws auth/profile-lookup-failed and calls signOut", async () => {
+        vi.mocked(getUserProfile).mockRejectedValueOnce(new Error("Database offline"));
+        vi.mocked(signOut).mockClear();
+
+        await expect(
+            verifyAndAuthorizeGoogleUser({ ...mockGoogleCitizenUser, uid: "google-err-09" })
+        ).rejects.toMatchObject({ code: "auth/profile-lookup-failed" });
+
+        expect(signOut).toHaveBeenCalled();
+    });
+
+    it("GGL-10: Malformed profile denied -> throws auth/malformed-profile and calls signOut", async () => {
+        const malformedProfile = {
+            uid: "google-bad-10",
+            email: "bad@test.com",
+            // missing role, accountStatus, approvalStatus, capabilities
+        };
+        vi.mocked(getUserProfile).mockResolvedValueOnce(malformedProfile);
+        vi.mocked(signOut).mockClear();
+
+        await expect(
+            verifyAndAuthorizeGoogleUser({ ...mockGoogleCitizenUser, uid: "google-bad-10" })
+        ).rejects.toMatchObject({ code: "auth/malformed-profile" });
+
+        expect(signOut).toHaveBeenCalled();
+    });
+
+    it("GGL-11: Claims isolation -> Google identity tokens/display cannot escalate role or commandLevel", async () => {
+        // Attacker claims to be COMMAND ADMINISTRATOR in Google identity
+        const maliciousGoogleUser = {
+            uid: "google-citizen-uid-01",
+            email: "citizen@example.com",
+            displayName: "Commander Attacker",
+            role: "COMMAND",
+            commandLevel: "ADMINISTRATOR",
+        };
+        vi.mocked(getUserProfile).mockResolvedValueOnce(validCitizenProfile);
+        vi.mocked(syncGoogleUserProfile).mockResolvedValueOnce({
+            ...validCitizenProfile,
+            displayName: "Commander Attacker",
+        });
+
+        const result = await verifyAndAuthorizeGoogleUser(maliciousGoogleUser);
+        expect(result.profile.role).toBe("CITIZEN");
+        expect(result.profile.commandLevel).toBeNull();
+    });
+
+    it("GGL-12: Route guard evaluation correctly routes Google accounts by assigned role", () => {
+        expect(evaluateRoleAuthorization(validCitizenProfile, "CITIZEN").isAuthorized).toBe(true);
+        expect(evaluateRoleAuthorization(validCitizenProfile, "COMMAND").isAuthorized).toBe(false);
+        expect(evaluateRoleAuthorization(validCitizenProfile, "RESPONDER").isAuthorized).toBe(false);
+    });
+
+    it("GGL-13: Denial cleanup -> signOut is guaranteed across all rejection branches", async () => {
+        vi.mocked(signOut).mockClear();
+        await expect(verifyAndAuthorizeGoogleUser(null)).rejects.toMatchObject({
+            code: "auth/invalid-credential",
+        });
+        expect(signOut).toHaveBeenCalled();
+    });
+
+    it("GGL-14: Structural validator correctly distinguishes complete from malformed profiles", () => {
+        expect(isValidProfileStructure(validCitizenProfile)).toBe(true);
+        expect(isValidProfileStructure(null)).toBe(false);
+        expect(isValidProfileStructure({})).toBe(false);
+        expect(isValidProfileStructure({ ...validCitizenProfile, role: "SUPERUSER" })).toBe(false);
+        expect(isValidProfileStructure({ ...validCitizenProfile, accountStatus: "PENDING" })).toBe(false);
+        expect(isValidProfileStructure({ ...validCitizenProfile, capabilities: "not-an-array" })).toBe(false);
+    });
+
+    it("GGL-15: Error formatter translates all Google authorization errors to user-friendly messages", () => {
+        expect(formatAuthError({ code: "auth/user-not-found" })).toContain("registration wizard");
+        expect(formatAuthError({ code: "auth/user-suspended" })).toContain("suspended");
+        expect(formatAuthError({ code: "auth/email-unverified" })).toContain("verification");
+        expect(formatAuthError({ code: "auth/malformed-profile" })).toContain("invalid or corrupted");
+        expect(formatAuthError({ code: "auth/profile-lookup-failed" })).toContain("network or database issue");
+    });
+
+    describe("AuthContext Async Profile Race Conditions (Defect 2 Remediation)", () => {
+        function RedirectTestConsumer({ onUpdate }) {
+            const ctx = useAuth();
+            useEffect(() => {
+                onUpdate(ctx);
+            }, [ctx, onUpdate]);
+            return React.createElement("div", null, ctx.status);
+        }
+
+        it("GGL-16: Stale async profile fetch on sign-out does not resurrect session or set profile", async () => {
+            let lastContext = null;
+            render(
+                React.createElement(
+                    AuthProvider,
+                    null,
+                    React.createElement(RedirectTestConsumer, { onUpdate: (c) => { lastContext = c; } })
+                )
+            );
+
+            // Set up a deferred promise for User A's profile
+            let resolveUserA;
+            const userAPromise = new Promise((resolve) => {
+                resolveUserA = resolve;
+            });
+            vi.mocked(getUserProfile).mockReturnValueOnce(userAPromise);
+
+            const userA = { uid: "user-a-race", emailVerified: true };
+            mockAuth.currentUser = userA;
+
+            // Trigger User A login in AuthContext
+            await act(async () => {
+                if (authStateCallback) authStateCallback(userA);
+            });
+
+            expect(lastContext.status).toBe("PROFILE_LOADING");
+
+            // User signs out while User A profile is still in-flight
+            mockAuth.currentUser = null;
+            await act(async () => {
+                if (authStateCallback) authStateCallback(null);
+            });
+
+            expect(lastContext.status).toBe("UNAUTHENTICATED");
+            expect(lastContext.profile).toBeNull();
+            expect(lastContext.user).toBeNull();
+
+            // Now delayed User A profile fetch completes
+            await act(async () => {
+                resolveUserA({
+                    ...validCitizenProfile,
+                    uid: "user-a-race",
+                });
+            });
+
+            // Must NOT have resurrected session or applied profile
+            expect(lastContext.status).toBe("UNAUTHENTICATED");
+            expect(lastContext.profile).toBeNull();
+            expect(lastContext.user).toBeNull();
+        });
+
+        it("GGL-17: Rapid identity switch (User A -> User B) does not allow delayed User A profile to overwrite User B", async () => {
+            let lastContext = null;
+            render(
+                React.createElement(
+                    AuthProvider,
+                    null,
+                    React.createElement(RedirectTestConsumer, { onUpdate: (c) => { lastContext = c; } })
+                )
+            );
+
+            // User A fetch is slow
+            let resolveUserA;
+            const userAPromise = new Promise((resolve) => {
+                resolveUserA = resolve;
+            });
+            vi.mocked(getUserProfile).mockReturnValueOnce(userAPromise);
+
+            const userA = { uid: "user-a-slow", emailVerified: true };
+            mockAuth.currentUser = userA;
+
+            await act(async () => {
+                if (authStateCallback) authStateCallback(userA);
+            });
+
+            // Fast forward: User B logs in immediately
+            const userB = { uid: "user-b-fast", emailVerified: true };
+            const profileB = {
+                ...validCitizenProfile,
+                uid: "user-b-fast",
+                displayName: "User B Active",
+            };
+            vi.mocked(getUserProfile).mockResolvedValueOnce(profileB);
+            mockAuth.currentUser = userB;
+
+            await act(async () => {
+                if (authStateCallback) authStateCallback(userB);
+            });
+
+            // User B should be active and authorized
+            expect(lastContext.status).toBe("AUTHORIZED");
+            expect(lastContext.profile?.uid).toBe("user-b-fast");
+            expect(lastContext.profile?.displayName).toBe("User B Active");
+
+            // Now User A's slow profile resolves
+            await act(async () => {
+                resolveUserA({
+                    ...validCitizenProfile,
+                    uid: "user-a-slow",
+                    displayName: "User A Stale",
+                });
+            });
+
+            // Active session must remain User B; User A's result must be discarded
+            expect(lastContext.status).toBe("AUTHORIZED");
+            expect(lastContext.profile?.uid).toBe("user-b-fast");
+            expect(lastContext.profile?.displayName).toBe("User B Active");
+        });
+
+        it("GGL-18: Delayed profile fetch error after signout or newer login does not set PROFILE_ERROR", async () => {
+            let lastContext = null;
+            render(
+                React.createElement(
+                    AuthProvider,
+                    null,
+                    React.createElement(RedirectTestConsumer, { onUpdate: (c) => { lastContext = c; } })
+                )
+            );
+
+            // User A lookup is pending
+            let rejectUserA;
+            const userAPromise = new Promise((_, reject) => {
+                rejectUserA = reject;
+            });
+            vi.mocked(getUserProfile).mockReturnValueOnce(userAPromise);
+
+            const userA = { uid: "user-a-err", emailVerified: true };
+            mockAuth.currentUser = userA;
+
+            await act(async () => {
+                if (authStateCallback) authStateCallback(userA);
+            });
+
+            // User signs out
+            mockAuth.currentUser = null;
+            await act(async () => {
+                if (authStateCallback) authStateCallback(null);
+            });
+
+            expect(lastContext.status).toBe("UNAUTHENTICATED");
+
+            // Stale lookup rejects with an error
+            await act(async () => {
+                rejectUserA(new Error("Network disconnect"));
+            });
+
+            // Stale rejection must be discarded, status remains UNAUTHENTICATED
+            expect(lastContext.status).toBe("UNAUTHENTICATED");
+            expect(lastContext.profile).toBeNull();
+        });
+    });
+
+    describe("Google Redirect Result Handling in AuthProvider", () => {
+        function RedirectTestConsumer({ onUpdate }) {
+            const ctx = useAuth();
+            useEffect(() => {
+                onUpdate(ctx);
+            }, [ctx, onUpdate]);
+            return null;
+        }
+        const validCitizenProfile = {
+            uid: "ggl-redir-01",
+            displayName: "Redirect Citizen",
+            email: "redir@example.com",
+            role: "CITIZEN",
+            capabilities: ["CITIZEN"],
+            citizenEnrollmentStatus: "ACTIVE",
+            responderApplicationStatus: "NOT_APPLIED",
+            registrationPath: "CITIZEN",
+            approvalStatus: "NOT_REQUIRED",
+            accountStatus: "ACTIVE",
+            emailVerified: true,
+            phoneVerified: false,
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+        };
+
+        beforeEach(() => {
+            vi.clearAllMocks();
+            mockAuth.currentUser = null;
+            authStateCallback = null;
+            vi.mocked(getRedirectResult).mockResolvedValue(null);
+        });
+
+        it("GGL-REDIR-01: handles no redirect result (null) cleanly", async () => {
+            vi.mocked(getRedirectResult).mockResolvedValueOnce(null);
+            let lastContext = null;
+            render(
+                React.createElement(
+                    AuthProvider,
+                    null,
+                    React.createElement(RedirectTestConsumer, { onUpdate: (c) => { lastContext = c; } })
+                )
+            );
+
+            await act(async () => {
+                if (authStateCallback) authStateCallback(null);
+            });
+
+            expect(getRedirectResult).toHaveBeenCalledTimes(1);
+            expect(lastContext.status).toBe("UNAUTHENTICATED");
+            expect(lastContext.profile).toBeNull();
+        });
+
+        it("GGL-REDIR-02: authorizes valid existing Google identity via redirect without duplicate profile lookup", async () => {
+            const googleUser = {
+                uid: "ggl-redir-01",
+                email: "redir@example.com",
+                emailVerified: true,
+                providerData: [{ providerId: "google.com" }],
+            };
+            vi.mocked(getRedirectResult).mockResolvedValueOnce({ user: googleUser });
+            vi.mocked(getUserProfile).mockResolvedValueOnce(validCitizenProfile);
+            vi.mocked(syncGoogleUserProfile).mockResolvedValueOnce(validCitizenProfile);
+            mockAuth.currentUser = googleUser;
+
+            let lastContext = null;
+            render(
+                React.createElement(
+                    AuthProvider,
+                    null,
+                    React.createElement(RedirectTestConsumer, { onUpdate: (c) => { lastContext = c; } })
+                )
+            );
+
+            await act(async () => {
+                if (authStateCallback) authStateCallback(googleUser);
+            });
+
+            expect(getRedirectResult).toHaveBeenCalledTimes(1);
+            expect(getUserProfile).toHaveBeenCalledTimes(1);
+            expect(syncGoogleUserProfile).toHaveBeenCalledTimes(1);
+            expect(lastContext.status).toBe("AUTHORIZED");
+            expect(lastContext.profile?.uid).toBe("ggl-redir-01");
+        });
+
+        it("GGL-REDIR-03: denies unknown Google redirect identity and signs out", async () => {
+            const unknownUser = {
+                uid: "ggl-redir-unknown",
+                email: "unknown@example.com",
+                emailVerified: true,
+                providerData: [{ providerId: "google.com" }],
+            };
+            vi.mocked(getRedirectResult).mockResolvedValueOnce({ user: unknownUser });
+            vi.mocked(getUserProfile).mockResolvedValueOnce(null);
+            mockAuth.currentUser = unknownUser;
+
+            let lastContext = null;
+            render(
+                React.createElement(
+                    AuthProvider,
+                    null,
+                    React.createElement(RedirectTestConsumer, { onUpdate: (c) => { lastContext = c; } })
+                )
+            );
+
+            await act(async () => {
+                if (authStateCallback) authStateCallback(unknownUser);
+            });
+
+            expect(signOut).toHaveBeenCalled();
+            expect(lastContext.status).toBe("UNAUTHENTICATED");
+            expect(lastContext.profile).toBeNull();
+        });
+
+        it("GGL-REDIR-04: denies unverified or suspended Google redirect identity and signs out", async () => {
+            const suspendedUser = {
+                uid: "ggl-redir-susp",
+                email: "susp@example.com",
+                emailVerified: true,
+                providerData: [{ providerId: "google.com" }],
+            };
+            vi.mocked(getRedirectResult).mockResolvedValueOnce({ user: suspendedUser });
+            vi.mocked(getUserProfile).mockResolvedValueOnce({
+                ...validCitizenProfile,
+                uid: "ggl-redir-susp",
+                accountStatus: "SUSPENDED",
+            });
+            mockAuth.currentUser = suspendedUser;
+
+            let lastContext = null;
+            render(
+                React.createElement(
+                    AuthProvider,
+                    null,
+                    React.createElement(RedirectTestConsumer, { onUpdate: (c) => { lastContext = c; } })
+                )
+            );
+
+            await act(async () => {
+                if (authStateCallback) authStateCallback(suspendedUser);
+            });
+
+            expect(signOut).toHaveBeenCalled();
+            expect(lastContext.status).toBe("UNAUTHENTICATED");
+            expect(lastContext.profile).toBeNull();
+        });
+
+        it("GGL-REDIR-05: does not process redirect result twice across StrictMode remount or repeated auth events", async () => {
+            const googleUser = {
+                uid: "ggl-redir-01",
+                email: "redir@example.com",
+                emailVerified: true,
+                providerData: [{ providerId: "google.com" }],
+            };
+            vi.mocked(getRedirectResult).mockResolvedValueOnce({ user: googleUser });
+            vi.mocked(getUserProfile).mockResolvedValue(validCitizenProfile);
+            vi.mocked(syncGoogleUserProfile).mockResolvedValue(validCitizenProfile);
+            mockAuth.currentUser = googleUser;
+
+            let lastContext = null;
+            render(
+                React.createElement(
+                    React.StrictMode,
+                    null,
+                    React.createElement(
+                        AuthProvider,
+                        null,
+                        React.createElement(RedirectTestConsumer, { onUpdate: (c) => { lastContext = c; } })
+                    )
+                )
+            );
+
+            await act(async () => {
+                if (authStateCallback) authStateCallback(googleUser);
+            });
+            await act(async () => {
+                if (authStateCallback) authStateCallback(googleUser);
+            });
+
+            expect(getRedirectResult).toHaveBeenCalledTimes(1);
+            expect(lastContext.status).toBe("AUTHORIZED");
+        });
+
+        it("GGL-REDIR-06: auth-state race does not overwrite authorized result with stale state", async () => {
+            const userA = {
+                uid: "ggl-redir-race-a",
+                email: "racea@example.com",
+                emailVerified: true,
+                providerData: [{ providerId: "google.com" }],
+            };
+            const userB = {
+                uid: "user-b-supersede",
+                email: "userb@example.com",
+                emailVerified: true,
+                providerData: [{ providerId: "password" }],
+            };
+            let resolveRedirect;
+            vi.mocked(getRedirectResult).mockReturnValueOnce(new Promise((res) => { resolveRedirect = res; }));
+            vi.mocked(getUserProfile).mockResolvedValue({
+                ...validCitizenProfile,
+                uid: "user-b-supersede",
+                displayName: "User B Superseding",
+            });
+
+            let lastContext = null;
+            render(
+                React.createElement(
+                    AuthProvider,
+                    null,
+                    React.createElement(RedirectTestConsumer, { onUpdate: (c) => { lastContext = c; } })
+                )
+            );
+
+            // User A triggers redirect flow, then User B signs in before redirect resolves
+            mockAuth.currentUser = userA;
+            const pA = act(async () => {
+                if (authStateCallback) authStateCallback(userA);
+            });
+
+            mockAuth.currentUser = userB;
+            await act(async () => {
+                if (authStateCallback) authStateCallback(userB);
+            });
+
+            // Now delayed redirect resolves for User A
+            await act(async () => {
+                resolveRedirect({ user: userA });
+                await pA;
+            });
+
+            // User B must remain active and authorized
+            expect(lastContext.status).toBe("AUTHORIZED");
+            expect(lastContext.profile?.uid).toBe("user-b-supersede");
+            expect(lastContext.profile?.displayName).toBe("User B Superseding");
+        });
     });
 });

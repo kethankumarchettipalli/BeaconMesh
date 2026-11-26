@@ -1,8 +1,8 @@
-import React, { createContext, useContext, useEffect, useState, useCallback, } from "react";
+import React, { createContext, useContext, useEffect, useState, useCallback, useRef, } from "react";
 import { onAuthStateChanged } from "firebase/auth";
 import { auth, isFirebaseConfigured } from "./firebase";
-import { getUserProfile, syncGoogleUserProfile, createFallbackProfile, syncEmailVerificationMirror, } from "./user-service";
-import { logOut, checkReloadEmailVerified } from "./auth-service";
+import { getUserProfile, isValidProfileStructure, syncEmailVerificationMirror, } from "./user-service";
+import { logOut, checkReloadEmailVerified, handleAuthRedirectResult } from "./auth-service";
 import { SESSION_ROLE_KEY, PENDING_RESPONDER_ROUTE, WORKSPACE_ROUTES, } from "./auth-types";
 export function isPendingResponderApplicant(profile) {
     if (!profile)
@@ -108,6 +108,9 @@ export function AuthProvider({ children }) {
     const [profile, setProfile] = useState(null);
     const [status, setStatus] = useState("INITIALIZING");
     const [loading, setLoading] = useState(true);
+    const activeRequestIdRef = useRef(0);
+    const redirectAttemptedRef = useRef(false);
+    const redirectPromiseRef = useRef(null);
     const [sessionRole, setSessionRoleState] = useState(() => {
         if (typeof window !== "undefined") {
             try {
@@ -133,75 +136,116 @@ export function AuthProvider({ children }) {
             catch { }
         }
     }, []);
-    const fetchAndApplyProfile = useCallback(async (currentUser) => {
+    const applyEvaluatedProfile = useCallback((currentUser, activeProfile) => {
+        setProfile(activeProfile);
+        // State Machine Evaluation (Strictly prioritized)
+        if (activeProfile.accountStatus === "SUSPENDED") {
+            setStatus("SUSPENDED");
+        }
+        else if (!currentUser.emailVerified || !activeProfile.emailVerified) {
+            // Trusted Firebase Auth emailVerified property + profile mirror requirement
+            setStatus("EMAIL_UNVERIFIED");
+        }
+        else if (activeProfile.capabilities.length === 0 &&
+            activeProfile.responderApplicationStatus === "PENDING") {
+            // Responder-only pending applicant (no active Citizen or Responder capabilities)
+            setStatus("RESPONDER_PENDING");
+        }
+        else if (activeProfile.capabilities.length === 0 &&
+            activeProfile.approvalStatus === "REJECTED") {
+            setStatus("UNAUTHORIZED");
+        }
+        else if (activeProfile.capabilities.length > 0 ||
+            activeProfile.role === "COMMAND") {
+            setStatus("AUTHORIZED");
+        }
+        else {
+            setStatus("UNAUTHORIZED");
+        }
+        return activeProfile;
+    }, []);
+    const fetchAndApplyProfile = useCallback(async (currentUser, targetRequestId) => {
+        const requestId = targetRequestId ?? ++activeRequestIdRef.current;
         setStatus("PROFILE_LOADING");
         try {
-            let userProfile = await getUserProfile(currentUser.uid);
-            if (!userProfile) {
-                // If profile doc not yet created, attempt sync (e.g. Google sign-in)
-                userProfile = await syncGoogleUserProfile(currentUser);
+            const userProfile = await getUserProfile(currentUser.uid);
+            // Invalidate if a newer request began, user signed out, or auth identity transitioned
+            if (requestId !== activeRequestIdRef.current || !auth?.currentUser || auth.currentUser.uid !== currentUser.uid) {
+                return null;
             }
             if (!userProfile) {
-                userProfile = createFallbackProfile(currentUser);
+                // Profile does not exist in Firestore: strictly fail closed.
+                // Do NOT synthesize fallback profiles. Do NOT auto-register.
+                setProfile(null);
+                setStatus("UNAUTHORIZED");
+                return null;
             }
-            // Mandatory Safeguard 4: Synchronize emailVerified mirror if confirmed by Firebase Auth
-            if (currentUser.emailVerified && userProfile && !userProfile.emailVerified) {
+
+            // Validate profile structural integrity
+            if (!isValidProfileStructure(userProfile)) {
+                setProfile(null);
+                setStatus("PROFILE_ERROR");
+                return null;
+            }
+
+            let activeProfile = userProfile;
+
+            // SEC-MIR-01: Synchronize emailVerified mirror if the Firebase Auth token is now
+            // verified but the Firestore profile mirror has not been updated yet.
+            // Restricted to email/password accounts only — Google sign-in must NOT use this path
+            // to gain any provisioning or authorization bypass.
+            const isGoogleProvider = currentUser.providerData?.some((p) => p.providerId === "google.com");
+            if (!isGoogleProvider && currentUser.emailVerified && !activeProfile.emailVerified) {
                 try {
                     const synced = await syncEmailVerificationMirror(currentUser);
-                    if (synced)
-                        userProfile = synced;
+                    if (requestId !== activeRequestIdRef.current || !auth?.currentUser || auth.currentUser.uid !== currentUser.uid) {
+                        return null;
+                    }
+                    if (synced) activeProfile = synced;
                 }
                 catch (syncErr) {
-                    console.warn("Could not synchronize email verification mirror:", syncErr);
+                    // syncEmailVerificationMirror now throws on failure — log a clear diagnostic
+                    // but do NOT crash the profile-loading flow. The user will remain in
+                    // EMAIL_UNVERIFIED state which is the correct safe-fail outcome.
+                    console.warn(
+                        "[SEC-MIR-01] Email verification mirror synchronization failed:",
+                        syncErr?.code || syncErr?.message,
+                        "— user will remain in EMAIL_UNVERIFIED state until mirror is updated."
+                    );
                 }
             }
-            setProfile(userProfile);
-            // State Machine Evaluation (Strictly prioritized)
-            if (userProfile.accountStatus === "SUSPENDED") {
-                setStatus("SUSPENDED");
+
+            if (requestId !== activeRequestIdRef.current || !auth?.currentUser || auth.currentUser.uid !== currentUser.uid) {
+                return null;
             }
-            else if (!currentUser.emailVerified) {
-                // Trusted Firebase Auth emailVerified property
-                setStatus("EMAIL_UNVERIFIED");
-            }
-            else if (userProfile.capabilities.length === 0 &&
-                userProfile.responderApplicationStatus === "PENDING") {
-                // Responder-only pending applicant (no active Citizen or Responder capabilities)
-                setStatus("RESPONDER_PENDING");
-            }
-            else if (userProfile.capabilities.length === 0 &&
-                userProfile.approvalStatus === "REJECTED") {
-                setStatus("UNAUTHORIZED");
-            }
-            else if (userProfile.capabilities.length > 0 ||
-                userProfile.role === "COMMAND") {
-                setStatus("AUTHORIZED");
-            }
-            else {
-                setStatus("UNAUTHORIZED");
-            }
-            return userProfile;
+
+            return applyEvaluatedProfile(currentUser, activeProfile);
         }
         catch (err) {
-            console.warn("Could not load user profile (using fallback):", err);
-            const fallback = createFallbackProfile(currentUser);
-            setProfile(fallback);
-            if (!currentUser.emailVerified) {
-                setStatus("EMAIL_UNVERIFIED");
+            if (requestId !== activeRequestIdRef.current || !auth?.currentUser || auth.currentUser.uid !== currentUser.uid) {
+                return null;
             }
-            else {
-                setStatus("PROFILE_ERROR");
-            }
-            return fallback;
+            console.warn("Could not load user profile:", err);
+            setProfile(null);
+            setStatus("PROFILE_ERROR");
+            return null;
         }
-    }, []);
+    }, [applyEvaluatedProfile]);
     useEffect(() => {
         if (!auth || !isFirebaseConfigured) {
             setLoading(false);
             setStatus("UNAUTHENTICATED");
             return;
         }
+        if (!redirectAttemptedRef.current) {
+            redirectAttemptedRef.current = true;
+            redirectPromiseRef.current = handleAuthRedirectResult().catch((err) => {
+                console.warn("[AuthProvider] Google redirect sign-in rejected or failed:", err?.code || err?.message);
+                return null;
+            });
+        }
         const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+            const requestId = ++activeRequestIdRef.current;
             setUser(currentUser);
             if (!currentUser) {
                 setProfile(null);
@@ -209,26 +253,44 @@ export function AuthProvider({ children }) {
                 setLoading(false);
                 return;
             }
+            // Immediately clear existing profile on identity change to prevent race condition exposure
+            setProfile(null);
             setLoading(true);
-            await fetchAndApplyProfile(currentUser);
-            setLoading(false);
+            const redirectResult = redirectPromiseRef.current ? await redirectPromiseRef.current : null;
+            if (requestId !== activeRequestIdRef.current || !auth?.currentUser || auth.currentUser.uid !== currentUser.uid) {
+                return;
+            }
+            if (redirectResult && redirectResult.user?.uid === currentUser.uid && redirectResult.profile) {
+                applyEvaluatedProfile(currentUser, redirectResult.profile);
+            }
+            else {
+                await fetchAndApplyProfile(currentUser, requestId);
+            }
+            if (requestId === activeRequestIdRef.current) {
+                setLoading(false);
+            }
         });
-        return () => unsubscribe();
-    }, [fetchAndApplyProfile]);
+        return () => {
+            activeRequestIdRef.current++;
+            unsubscribe();
+        };
+    }, [fetchAndApplyProfile, applyEvaluatedProfile]);
     const refreshProfile = useCallback(async () => {
-        if (!user)
+        if (!user || !auth?.currentUser || auth.currentUser.uid !== user.uid)
             return null;
-        return await fetchAndApplyProfile(user);
+        const requestId = ++activeRequestIdRef.current;
+        return await fetchAndApplyProfile(user, requestId);
     }, [user, fetchAndApplyProfile]);
     const reloadUser = useCallback(async () => {
         const verified = await checkReloadEmailVerified();
-        if (user) {
+        if (user && auth?.currentUser && auth.currentUser.uid === user.uid) {
             setUser({ ...user, emailVerified: verified });
             await refreshProfile();
         }
         return verified;
     }, [user, refreshProfile]);
     const handleSignOut = useCallback(async () => {
+        activeRequestIdRef.current++;
         try {
             await logOut();
         }
@@ -237,6 +299,7 @@ export function AuthProvider({ children }) {
             setProfile(null);
             setSessionRoleState(null);
             setStatus("UNAUTHENTICATED");
+            setLoading(false);
             try {
                 sessionStorage.removeItem(SESSION_ROLE_KEY);
                 localStorage.removeItem("beaconmesh-role");

@@ -4,9 +4,11 @@ import { Eye, EyeOff, Loader2, AlertTriangle, ArrowRight, CheckCircle2, Mail, Sh
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { loginWithEmail, registerWithEmail, loginWithGoogle, resetPassword, resendVerificationEmail, completeEmailVerification, formatAuthError, } from "@/lib/auth-service";
-import { getUserProfile, createFallbackProfile } from "@/lib/user-service";
+import { getUserProfile } from "@/lib/user-service";
+import { auth } from "@/lib/firebase";
 import { useAuth, evaluateRoleAuthorization } from "@/lib/auth-context";
 import { WORKSPACE_ROUTES, PENDING_RESPONDER_ROUTE, } from "@/lib/auth-types";
+export { RegistrationWizard } from "./registration-wizard";
 function GoogleIcon() {
     return (<svg className="h-4 w-4" viewBox="0 0 24 24" aria-hidden="true">
       <path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.8-2.4 3.65v3.05h3.88c2.27-2.09 3.66-5.17 3.66-9.14z"/>
@@ -83,9 +85,25 @@ export function LoginForm() {
         setLoading(true);
         try {
             const user = await loginWithEmail(email, password);
+            // SEC-MIR-01: Reload the Firebase Auth user and force a JWT refresh before
+            // checking emailVerified. The token returned by signInWithEmailAndPassword may
+            // still carry the previous (pre-verification) email_verified claim if the user
+            // verified their email in a different tab or session. Without reload+refresh, the
+            // in-memory user.emailVerified property is stale and causes a false loop.
+            try {
+                await user.reload();
+                await user.getIdToken(true); // force JWT refresh
+            }
+            catch (reloadErr) {
+                // Non-fatal: proceed with the state we have; worst case the user sees
+                // the verification banner and can retry via the "Check verification status" button.
+                console.warn("[LoginForm] Token reload failed, proceeding with current state:", reloadErr?.message);
+            }
+            // Re-read the current user from auth after reload (reload() mutates auth.currentUser in-place)
+            const freshUser = auth?.currentUser || user;
             // Check email verification for email/password credentials
-            if (!user.emailVerified) {
-                setUnverifiedEmail(user.email || email);
+            if (!freshUser.emailVerified) {
+                setUnverifiedEmail(freshUser.email || email);
                 setLoading(false);
                 setLoginState("idle");
                 return;
@@ -94,7 +112,10 @@ export function LoginForm() {
             // Retrieve actual profile from Firestore to verify assigned role
             let profile = await getUserProfile(user.uid);
             if (!profile) {
-                profile = createFallbackProfile(user);
+                setError("Account profile could not be found. Please contact support or register again.");
+                setLoading(false);
+                setLoginState("error");
+                return;
             }
             if (profile.accountStatus === "SUSPENDED") {
                 setError("Your account is currently suspended. Please contact your coordinator or operations command.");
@@ -136,7 +157,10 @@ export function LoginForm() {
         }
     };
     const handleGoogleSignIn = async () => {
+        if (loading)
+            return;
         setError(null);
+        setRoleMismatch(null);
         setUnverifiedEmail(null);
         if (!isConfigured) {
             setError("Firebase is not configured. Please add your VITE_FIREBASE_* credentials to .env.local.");
@@ -150,6 +174,12 @@ export function LoginForm() {
                 setError("Your account is suspended. Contact operations administration.");
                 setLoading(false);
                 setLoginState("error");
+                return;
+            }
+            if (!profile.emailVerified) {
+                setUnverifiedEmail(profile.email || currentUser?.email || "");
+                setLoading(false);
+                setLoginState("idle");
                 return;
             }
             setLoginState("loading-profile");
@@ -414,28 +444,6 @@ export function SignupForm() {
             setLoading(false);
         }
     };
-    const handleGoogleSignIn = async () => {
-        setError(null);
-        if (!isConfigured) {
-            setError("Firebase is not configured.");
-            return;
-        }
-        setSignupState("submitting");
-        setLoading(true);
-        try {
-            const { profile } = await loginWithGoogle();
-            await refreshProfile();
-            setSignupState("redirecting");
-            void navigate({ to: WORKSPACE_ROUTES[profile.role] });
-        }
-        catch (err) {
-            setError(formatAuthError(err));
-            setSignupState("error");
-        }
-        finally {
-            setLoading(false);
-        }
-    };
     return (<div className="space-y-6">
       {/* Account Type Selector */}
       <fieldset className="space-y-2">
@@ -571,26 +579,13 @@ export function SignupForm() {
           </Button>
         </div>)}
 
-      {/* Divider */}
-      <div className="relative flex items-center justify-center py-2">
-        <div className="absolute inset-0 flex items-center">
-          <div className="w-full border-t border-border"/>
-        </div>
-        <span className="relative bg-background px-3 text-[0.7rem] uppercase tracking-wider text-muted-foreground">
-          or continue with
-        </span>
+      {/* Existing account note */}
+      <div className="pt-2 text-center text-xs text-muted-foreground">
+        Already have a BeaconMesh account linked to Google?{" "}
+        <Link to="/login" className="font-medium text-signal hover:underline">
+          Sign in on the Login page
+        </Link>
       </div>
-
-      {/* Google Sign In */}
-      <Button type="button" variant="outline" onClick={handleGoogleSignIn} disabled={loading} className="flex w-full items-center justify-center gap-2.5">
-        {loading && signupState === "submitting" ? (<>
-            <Loader2 className="h-4 w-4 animate-spin"/>
-            <span>Connecting to Google...</span>
-          </>) : (<>
-            <GoogleIcon />
-            <span>Continue with Google</span>
-          </>)}
-      </Button>
     </div>);
 }
 // ==========================================

@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeAll, afterAll, beforeEach } from "vitest";
 import { initializeTestEnvironment, assertSucceeds, assertFails, } from "@firebase/rules-unit-testing";
-import { doc, getDoc, setDoc, updateDoc, deleteDoc, writeBatch } from "firebase/firestore";
+import { doc, getDoc, setDoc, updateDoc, deleteDoc, writeBatch, serverTimestamp } from "firebase/firestore";
 import * as fs from "node:fs";
 import * as path from "node:path";
 describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
@@ -42,7 +42,7 @@ describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
         const uid = "citizen-alice";
         const alice = testEnv.authenticatedContext(uid, {
             email: "alice@example.com",
-            email_verified: false,
+            email_verified: true,
         });
         const db = alice.firestore();
         const citizenDoc = {
@@ -60,7 +60,7 @@ describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
             registrationPath: "CITIZEN",
             approvalStatus: "NOT_REQUIRED",
             phoneVerified: false,
-            emailVerified: false,
+            emailVerified: true,
             accountStatus: "ACTIVE",
             createdAt: new Date(),
             updatedAt: new Date(),
@@ -72,7 +72,7 @@ describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
         const uid = "volunteer-bob";
         const bob = testEnv.authenticatedContext(uid, {
             email: "bob@example.com",
-            email_verified: false,
+            email_verified: true,
         });
         const db = bob.firestore();
         const responderDoc = {
@@ -90,12 +90,42 @@ describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
             requestedResponderSubtype: "VOLUNTEER",
             approvalStatus: "PENDING",
             phoneVerified: false,
-            emailVerified: false,
+            emailVerified: true,
             accountStatus: "ACTIVE",
             createdAt: new Date(),
             updatedAt: new Date(),
         };
         await assertSucceeds(setDoc(doc(db, "users", uid), responderDoc));
+    });
+    // SEC-01 Attack: Unverified email token is rejected
+    it("SEC-01 Attack: rejects self-registration when auth token is unverified", async () => {
+        const uid = "unverified-charlie";
+        const charlie = testEnv.authenticatedContext(uid, {
+            email: "charlie@example.com",
+            email_verified: false,
+        });
+        const db = charlie.firestore();
+        const unverifiedDoc = {
+            uid,
+            displayName: "Charlie Unverified",
+            email: "charlie@example.com",
+            role: "CITIZEN",
+            responderSubtype: null,
+            commandLevel: null,
+            requestedRole: null,
+            requestedResponderSubtype: null,
+            capabilities: ["CITIZEN"],
+            citizenEnrollmentStatus: "ACTIVE",
+            responderApplicationStatus: "NOT_APPLIED",
+            registrationPath: "CITIZEN",
+            approvalStatus: "NOT_REQUIRED",
+            phoneVerified: false,
+            emailVerified: true,
+            accountStatus: "ACTIVE",
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        };
+        await assertFails(setDoc(doc(db, "users", uid), unverifiedDoc));
     });
     // 4. Attack Test: Citizen cannot write responder locations
     it("Attack 1: Citizen cannot write responder locations", async () => {
@@ -1007,18 +1037,20 @@ describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
             // Administrator suspending an account
             await assertSucceeds(updateDoc(doc(db, "users", citizenUid), {
                 accountStatus: "SUSPENDED",
-                updatedAt: new Date(),
+                updatedAt: serverTimestamp(),
             }));
+
             // Administrator updating profile display name and phone
             await assertSucceeds(updateDoc(doc(db, "users", responderUid), {
                 displayName: "Promoted Field Lead",
                 phoneNumber: "+91 9876543210",
-                updatedAt: new Date(),
+                updatedAt: serverTimestamp(),
             }));
+
             // Phase 0.2: Administrator cannot modify responderSubtype via generic admin update
             await assertFails(updateDoc(doc(db, "users", responderUid), {
                 responderSubtype: "PROFESSIONAL",
-                updatedAt: new Date(),
+                updatedAt: serverTimestamp(),
             }));
             // Verify persisted updates
             await testEnv.withSecurityRulesDisabled(async (context) => {
@@ -1378,9 +1410,10 @@ describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
                 accountStatus: "ACTIVE",
             });
             const db = coordCtx.firestore();
-            const approvalTime = new Date();
-            // Lawful approval via isValidUserCoordinatorUpdate path
-            await assertSucceeds(updateDoc(doc(db, "users", applicantUid), {
+            const reviewId = `rev-h10-${applicantUid}-${Date.now()}`;
+            const batch = writeBatch(db);
+            // 1. User profile approval transition
+            batch.update(doc(db, "users", applicantUid), {
                 role: "RESPONDER",
                 responderSubtype: "VOLUNTEER",
                 approvalStatus: "APPROVED",
@@ -1391,10 +1424,43 @@ describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
                 activeIncidentId: null,
                 reviewedBy: coordUid,
                 approvedBy: coordUid,
-                reviewedAt: approvalTime,
-                approvedAt: approvalTime,
-                updatedAt: approvalTime,
-            }));
+                reviewedAt: serverTimestamp(),
+                approvedAt: serverTimestamp(),
+                lastReviewId: reviewId,
+                updatedAt: serverTimestamp(),
+            });
+            // 2. Responder profile creation
+            batch.set(doc(db, "responderProfiles", applicantUid), {
+                uid: applicantUid,
+                displayName: "Pending Applicant Gamma",
+                email: "applicant02@example.com",
+                phoneNumber: null,
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                certifications: ["Basic First Aid"],
+                skills: ["Search and Rescue"],
+                updatedAt: new Date().toISOString(),
+            });
+            // 3. Review audit log
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                applicantName: "Pending Applicant Gamma",
+                applicantEmail: "applicant02@example.com",
+                decision: "APPROVED",
+                requestedSubtype: "VOLUNTEER",
+                assignedSubtype: "VOLUNTEER",
+                reviewerUid: coordUid,
+                reviewerRole: "COORDINATOR",
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                rejectionReason: null,
+                reviewerNotes: "Approved in hardening test",
+                reviewedAt: serverTimestamp(),
+            });
+
+            await assertSucceeds(batch.commit());
             await testEnv.withSecurityRulesDisabled(async (context) => {
                 const snap = await getDoc(doc(context.firestore(), "users", applicantUid));
                 expect(snap.data()?.role).toBe("RESPONDER");
@@ -1412,9 +1478,10 @@ describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
                 accountStatus: "ACTIVE",
             });
             const db = coordCtx.firestore();
-            const rejectTime = new Date();
-            // Lawful rejection via isValidUserCoordinatorUpdate path (preserves Citizen capability)
-            await assertSucceeds(updateDoc(doc(db, "users", applicantUid), {
+            const reviewId = `rev-h11-${applicantUid}-${Date.now()}`;
+            const batch = writeBatch(db);
+            // 1. User profile rejection transition
+            batch.update(doc(db, "users", applicantUid), {
                 role: "CITIZEN",
                 responderSubtype: null,
                 approvalStatus: "REJECTED",
@@ -1423,9 +1490,29 @@ describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
                 citizenEnrollmentStatus: "ACTIVE",
                 rejectionReason: "Prerequisite first aid certification not provided",
                 reviewedBy: coordUid,
-                reviewedAt: rejectTime,
-                updatedAt: rejectTime,
-            }));
+                reviewedAt: serverTimestamp(),
+                lastReviewId: reviewId,
+                updatedAt: serverTimestamp(),
+            });
+            // 2. Review audit log
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                applicantName: "Pending Applicant Gamma",
+                applicantEmail: "applicant02@example.com",
+                decision: "REJECTED",
+                requestedSubtype: "VOLUNTEER",
+                assignedSubtype: null,
+                reviewerUid: coordUid,
+                reviewerRole: "COORDINATOR",
+                previousStatus: "PENDING",
+                newStatus: "REJECTED",
+                rejectionReason: "Prerequisite first aid certification not provided",
+                reviewerNotes: "Rejected in hardening test",
+                reviewedAt: serverTimestamp(),
+            });
+
+            await assertSucceeds(batch.commit());
             await testEnv.withSecurityRulesDisabled(async (context) => {
                 const snap = await getDoc(doc(context.firestore(), "users", applicantUid));
                 expect(snap.data()?.role).toBe("CITIZEN");
@@ -1650,8 +1737,8 @@ describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
             // Mirror update: toggle emailVerified to true with emailVerifiedAt and updatedAt
             await assertSucceeds(updateDoc(doc(db, "users", uid), {
                 emailVerified: true,
-                emailVerifiedAt: new Date(),
-                updatedAt: new Date(),
+                emailVerifiedAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
             }));
         });
         it("RR 2: rejects emailVerified mirror update if Auth token does NOT carry email_verified: true", async () => {
@@ -1724,6 +1811,2562 @@ describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
             await assertSucceeds(getDoc(doc(db, "safeZones", "sz-vja-verified-alias")));
             // Unverified safe zone cannot be read by citizen
             await assertFails(getDoc(doc(db, "safezones", "sz-vja-provisional")));
+        });
+    });
+
+    // ===============================================================
+    // SECURITY REMEDIATION: SEC-01, COMMAND AUTH & ACCOUNT STATUS
+    // ===============================================================
+    describe("Security Remediation: SEC-01, Command Authorization & Account Status Consistency", () => {
+        const incidentId = "INC-REMED-001";
+
+        beforeEach(async () => {
+            // Seed a representative incident for operational read/write testing
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "incidents", incidentId), {
+                    id: incidentId,
+                    type: "Medical",
+                    place: "MG Road, Vijayawada",
+                    status: "In progress",
+                    priority: "Critical",
+                    createdBy: "creator-remed",
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+        });
+
+        // --- 1. SEC-01: Strict Email Verification ---
+        it("SEC-01-A: Token email_verified: false + Profile emailVerified: true -> DENIED", async () => {
+            const uid = "user-sec01-a";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", uid), {
+                    uid,
+                    displayName: "Spoofed Verified User",
+                    email: "spoof-a@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    approvalStatus: "NOT_REQUIRED",
+                    accountStatus: "ACTIVE",
+                    emailVerified: true, // Profile mirror claims true
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "spoof-a@example.com",
+                email_verified: false, // Token claim is false
+            });
+            const db = ctx.firestore();
+            await assertFails(getDoc(doc(db, "incidents", incidentId)));
+        });
+
+        it("SEC-01-B: Token missing email_verified claim + Profile emailVerified: true -> DENIED", async () => {
+            const uid = "user-sec01-b";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", uid), {
+                    uid,
+                    displayName: "Missing Claim User",
+                    email: "missing-b@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    approvalStatus: "NOT_REQUIRED",
+                    accountStatus: "ACTIVE",
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "missing-b@example.com",
+                // email_verified omitted
+            });
+            const db = ctx.firestore();
+            await assertFails(getDoc(doc(db, "incidents", incidentId)));
+        });
+
+        it("SEC-01-C: Token email_verified: true + Profile emailVerified: false -> Dual Verification Required (DENIED)", async () => {
+            const uid = "user-sec01-c";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", uid), {
+                    uid,
+                    displayName: "Verified Token User",
+                    email: "verified-c@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    approvalStatus: "NOT_REQUIRED",
+                    accountStatus: "ACTIVE",
+                    emailVerified: false, // Mirror not yet synced
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "verified-c@example.com",
+                email_verified: true, // Trusted token claim is true
+            });
+            const db = ctx.firestore();
+            await assertFails(getDoc(doc(db, "incidents", incidentId)));
+        });
+
+        it("SEC-01-D: No profile exists + Token email_verified: false -> DENIED", async () => {
+            const uid = "orphan-unverified-user";
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "orphan@example.com",
+                email_verified: false,
+            });
+            const db = ctx.firestore();
+            await assertFails(getDoc(doc(db, "incidents", incidentId)));
+        });
+
+        // --- 2. Account Status: Canonical Firestore Authority ---
+        it("ACCT-1: Active token claim + Suspended profile -> DENIED", async () => {
+            const uid = "user-suspended-profile";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", uid), {
+                    uid,
+                    displayName: "Suspended User",
+                    email: "suspended@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    approvalStatus: "NOT_REQUIRED",
+                    accountStatus: "SUSPENDED", // Canonical authority is SUSPENDED
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "suspended@example.com",
+                email_verified: true,
+                accountStatus: "ACTIVE", // Stale or spoofed token claim says ACTIVE
+            });
+            const db = ctx.firestore();
+            await assertFails(getDoc(doc(db, "incidents", incidentId)));
+        });
+
+        it("ACCT-2: Suspended token claim + Active profile -> Follows Canonical Profile (ALLOWED)", async () => {
+            const uid = "user-active-profile-stale-token";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", uid), {
+                    uid,
+                    displayName: "Active User",
+                    email: "active@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    approvalStatus: "NOT_REQUIRED",
+                    accountStatus: "ACTIVE", // Canonical authority is ACTIVE
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "active@example.com",
+                email_verified: true,
+                accountStatus: "SUSPENDED", // Token claim says SUSPENDED
+            });
+            const db = ctx.firestore();
+            await assertSucceeds(getDoc(doc(db, "incidents", incidentId)));
+        });
+
+        it("ACCT-3: Active verified user with missing accountStatus in profile -> DENIED (fails closed)", async () => {
+            const uid = "user-missing-status";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", uid), {
+                    uid,
+                    displayName: "No Status User",
+                    email: "nostatus@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    approvalStatus: "NOT_REQUIRED",
+                    // accountStatus omitted
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "nostatus@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            await assertFails(getDoc(doc(db, "incidents", incidentId)));
+        });
+
+        it("ACCT-4: Active verified user with unknown accountStatus in profile -> DENIED (fails closed)", async () => {
+            const uid = "user-unknown-status";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", uid), {
+                    uid,
+                    displayName: "Unknown Status User",
+                    email: "unknown@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    approvalStatus: "NOT_REQUIRED",
+                    accountStatus: "PENDING_VERIFICATION", // Unknown / non-ACTIVE
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "unknown@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            await assertFails(getDoc(doc(db, "incidents", incidentId)));
+        });
+
+        // --- 3. Command Authorization: Independently Secure ---
+        it("CMD-1: Unverified Command Admin token + valid Command profile -> DENIED", async () => {
+            const adminUid = "cmd-admin-unverified";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", adminUid), {
+                    uid: adminUid,
+                    displayName: "Unverified Admin",
+                    email: "admin-unverified@vmc.gov.in",
+                    role: "COMMAND",
+                    commandLevel: "ADMINISTRATOR",
+                    capabilities: ["COMMAND"],
+                    accountStatus: "ACTIVE",
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const ctx = testEnv.authenticatedContext(adminUid, {
+                email: "admin-unverified@vmc.gov.in",
+                email_verified: false, // Token unverified
+            });
+            const db = ctx.firestore();
+            // Reading another user's profile requires isCommandUser()
+            await assertFails(getDoc(doc(db, "users", "citizen-alice")));
+        });
+
+        it("CMD-2: Missing verification claim in Command Admin token -> DENIED", async () => {
+            const adminUid = "cmd-admin-missing-claim";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", adminUid), {
+                    uid: adminUid,
+                    displayName: "Missing Claim Admin",
+                    email: "admin-noclaim@vmc.gov.in",
+                    role: "COMMAND",
+                    commandLevel: "ADMINISTRATOR",
+                    capabilities: ["COMMAND"],
+                    accountStatus: "ACTIVE",
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const ctx = testEnv.authenticatedContext(adminUid, {
+                email: "admin-noclaim@vmc.gov.in",
+                // email_verified omitted
+            });
+            const db = ctx.firestore();
+            await assertFails(getDoc(doc(db, "users", "citizen-alice")));
+        });
+
+        it("CMD-3: Verified Citizen profile attempting Command access -> DENIED", async () => {
+            const citUid = "citizen-pretender";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", citUid), {
+                    uid: citUid,
+                    displayName: "Pretender",
+                    email: "pretender@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    accountStatus: "ACTIVE",
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const ctx = testEnv.authenticatedContext(citUid, {
+                email: "pretender@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            // Attempt Command-only read of another user's profile
+            await assertFails(getDoc(doc(db, "users", "citizen-alice")));
+            // Attempt Command-only create of safe zone
+            await assertFails(setDoc(doc(db, "safezones", "sz-cit-attack"), {
+                id: "sz-cit-attack",
+                name: "Fake Safezone",
+                verificationStatus: "VERIFIED",
+                capacity: 100,
+                location: { latitude: 16.5, longitude: 80.6 },
+            }));
+        });
+
+        it("CMD-4: Verified Responder applicant attempting Command access -> DENIED", async () => {
+            const respUid = "resp-applicant-attack";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", respUid), {
+                    uid: respUid,
+                    displayName: "Pending Responder",
+                    email: "pending-resp@example.com",
+                    role: "CITIZEN",
+                    capabilities: [],
+                    citizenEnrollmentStatus: "INACTIVE",
+                    responderApplicationStatus: "PENDING",
+                    approvalStatus: "PENDING",
+                    accountStatus: "ACTIVE",
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const ctx = testEnv.authenticatedContext(respUid, {
+                email: "pending-resp@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            await assertFails(getDoc(doc(db, "users", "citizen-alice")));
+        });
+
+        it("CMD-5: Verified Command Admin with valid profile -> ALLOWED for Admin operations", async () => {
+            const adminUid = "cmd-admin-valid";
+            const targetCitizenUid = "citizen-target-suspend";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", adminUid), {
+                    uid: adminUid,
+                    displayName: "Valid Administrator",
+                    email: "admin-valid@vmc.gov.in",
+                    role: "COMMAND",
+                    commandLevel: "ADMINISTRATOR",
+                    capabilities: ["COMMAND"],
+                    accountStatus: "ACTIVE",
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+                await setDoc(doc(fdb, "users", targetCitizenUid), {
+                    uid: targetCitizenUid,
+                    displayName: "Citizen Target",
+                    email: "target@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    approvalStatus: "NOT_REQUIRED",
+                    accountStatus: "ACTIVE",
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const ctx = testEnv.authenticatedContext(adminUid, {
+                email: "admin-valid@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            // Admin can read another user's profile
+            await assertSucceeds(getDoc(doc(db, "users", targetCitizenUid)));
+            // Admin can perform administrative accountStatus suspension
+            await assertSucceeds(updateDoc(doc(db, "users", targetCitizenUid), {
+                accountStatus: "SUSPENDED",
+                updatedAt: new Date(),
+            }));
+        });
+
+        it("CMD-6: Verified Command Operations (Coordinator) -> ALLOWED for Operations actions", async () => {
+            const coordUid = "cmd-coord-valid";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", coordUid), {
+                    uid: coordUid,
+                    displayName: "Valid Coordinator",
+                    email: "coord-valid@vmc.gov.in",
+                    role: "COMMAND",
+                    commandLevel: "COORDINATOR",
+                    capabilities: ["COMMAND"],
+                    accountStatus: "ACTIVE",
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const ctx = testEnv.authenticatedContext(coordUid, {
+                email: "coord-valid@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            // Operations Coordinator can manage safezones (create)
+            await assertSucceeds(setDoc(doc(db, "safezones", "sz-ops-coord-created"), {
+                id: "sz-ops-coord-created",
+                name: "Operations Relief Station",
+                verificationStatus: "VERIFIED",
+                capacity: 500,
+                location: { latitude: 16.51, longitude: 80.64 },
+            }));
+        });
+
+        it("CMD-7: Command Operations (Coordinator) attempting Admin-only actions -> DENIED", async () => {
+            const coordUid = "cmd-coord-attacker";
+            const targetCitizenUid = "citizen-target-admin-only";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", coordUid), {
+                    uid: coordUid,
+                    displayName: "Coordinator",
+                    email: "coord-attacker@vmc.gov.in",
+                    role: "COMMAND",
+                    commandLevel: "COORDINATOR",
+                    capabilities: ["COMMAND"],
+                    accountStatus: "ACTIVE",
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+                await setDoc(doc(fdb, "users", targetCitizenUid), {
+                    uid: targetCitizenUid,
+                    displayName: "Citizen Target",
+                    email: "target2@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    approvalStatus: "NOT_REQUIRED",
+                    accountStatus: "ACTIVE",
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const ctx = testEnv.authenticatedContext(coordUid, {
+                email: "coord-attacker@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            // Coordinator CANNOT suspend accounts (Admin-only action)
+            await assertFails(updateDoc(doc(db, "users", targetCitizenUid), {
+                accountStatus: "SUSPENDED",
+                updatedAt: new Date(),
+            }));
+        });
+
+        it("CMD-8: Public user attempting to create a Command profile -> DENIED", async () => {
+            const uid = "public-command-attacker";
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "attacker@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            await assertFails(setDoc(doc(db, "users", uid), {
+                uid,
+                displayName: "Fake Admin",
+                email: "attacker@example.com",
+                role: "COMMAND",
+                commandLevel: "ADMINISTRATOR",
+                capabilities: ["COMMAND"],
+                citizenEnrollmentStatus: "INACTIVE",
+                responderApplicationStatus: "NOT_APPLIED",
+                approvalStatus: "NOT_REQUIRED",
+                accountStatus: "ACTIVE",
+                emailVerified: true,
+                phoneVerified: false,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+            }));
+        });
+
+        it("CMD-9: User attempting to modify their own role, commandLevel, or capabilities -> DENIED", async () => {
+            const uid = "self-escalator";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", uid), {
+                    uid,
+                    displayName: "Escalator",
+                    email: "escalator@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    approvalStatus: "NOT_REQUIRED",
+                    accountStatus: "ACTIVE",
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "escalator@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            // Self-escalate to COMMAND role
+            await assertFails(updateDoc(doc(db, "users", uid), {
+                role: "COMMAND",
+                updatedAt: new Date(),
+            }));
+            // Self-escalate commandLevel
+            await assertFails(updateDoc(doc(db, "users", uid), {
+                commandLevel: "ADMINISTRATOR",
+                updatedAt: new Date(),
+            }));
+            // Self-grant COMMAND capability
+            await assertFails(updateDoc(doc(db, "users", uid), {
+                capabilities: ["CITIZEN", "COMMAND"],
+                updatedAt: new Date(),
+            }));
+        });
+    });
+
+    // =========================================================================
+    // Phase 1 Task 2: Responder Application Approval Workflow (APP-01 - APP-17)
+    // =========================================================================
+    describe("Phase 1 Task 2: Responder Application Approval Workflow (APP-01 - APP-17)", () => {
+        const coordUid = "coord-wf-01";
+        const adminUid = "admin-wf-01";
+        const citizenUid = "citizen-wf-01";
+        const applicantUid = "applicant-wf-01";
+
+        beforeEach(async () => {
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                const now = new Date();
+
+                // 1. Incident Coordinator (COMMAND / COORDINATOR)
+                await setDoc(doc(fdb, "users", coordUid), {
+                    uid: coordUid,
+                    displayName: "VMC Incident Coordinator",
+                    email: "coordinator@vmc.gov.in",
+                    role: "COMMAND",
+                    commandLevel: "COORDINATOR",
+                    capabilities: ["COMMAND"],
+                    citizenEnrollmentStatus: "INACTIVE",
+                    responderApplicationStatus: "NOT_APPLIED",
+                    approvalStatus: "NOT_REQUIRED",
+                    accountStatus: "ACTIVE",
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: now,
+                    updatedAt: now,
+                });
+
+                // 2. Administrator (COMMAND / ADMINISTRATOR)
+                await setDoc(doc(fdb, "users", adminUid), {
+                    uid: adminUid,
+                    displayName: "State Disaster Admin",
+                    email: "admin@apsdma.gov.in",
+                    role: "COMMAND",
+                    commandLevel: "ADMINISTRATOR",
+                    capabilities: ["COMMAND"],
+                    citizenEnrollmentStatus: "INACTIVE",
+                    responderApplicationStatus: "NOT_APPLIED",
+                    approvalStatus: "NOT_REQUIRED",
+                    accountStatus: "ACTIVE",
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: now,
+                    updatedAt: now,
+                });
+
+                // 3. Regular Citizen (CITIZEN)
+                await setDoc(doc(fdb, "users", citizenUid), {
+                    uid: citizenUid,
+                    displayName: "Vijayawada Citizen",
+                    email: "citizen.vja@example.com",
+                    role: "CITIZEN",
+                    commandLevel: null,
+                    responderSubtype: null,
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    responderApplicationStatus: "NOT_APPLIED",
+                    approvalStatus: "NOT_REQUIRED",
+                    accountStatus: "ACTIVE",
+                    emailVerified: true,
+                    phoneVerified: false,
+                    createdAt: now,
+                    updatedAt: now,
+                });
+
+                // 4. Pending Responder Applicant (Dual-capable candidate)
+                await setDoc(doc(fdb, "users", applicantUid), {
+                    uid: applicantUid,
+                    displayName: "Pending Responder Applicant",
+                    email: "applicant.vja@example.com",
+                    role: "CITIZEN",
+                    commandLevel: null,
+                    responderSubtype: null,
+                    requestedRole: "RESPONDER",
+                    requestedResponderSubtype: "VOLUNTEER",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    responderApplicationStatus: "PENDING",
+                    approvalStatus: "PENDING",
+                    dutyStatus: null,
+                    activeIncidentId: null,
+                    accountStatus: "ACTIVE",
+                    phoneVerified: false,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                });
+            });
+        });
+
+        it("APP-01: Valid Coordinator approves pending responder atomically -> assertSucceeds", async () => {
+            const ctx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            const now = new Date();
+            const reviewId = `rev-app01-${applicantUid}-${now.getTime()}`;
+
+            const batch = writeBatch(db);
+            // 1. User transition granting dual capability
+            batch.update(doc(db, "users", applicantUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE",
+                dutyStatus: "OFF_DUTY",
+                activeIncidentId: null,
+                reviewedBy: coordUid,
+                approvedBy: coordUid,
+                reviewedAt: serverTimestamp(),
+                approvedAt: serverTimestamp(),
+                lastReviewId: reviewId,
+                updatedAt: serverTimestamp(),
+            });
+            // 2. Responder profile initialization
+            batch.set(doc(db, "responderProfiles", applicantUid), {
+                uid: applicantUid,
+                displayName: "Pending Responder Applicant",
+                email: "applicant.vja@example.com",
+                phoneNumber: null,
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                certifications: ["Basic First Aid"],
+                skills: ["Search and Rescue"],
+                updatedAt: now.toISOString(),
+            });
+            // 3. Append-only audit record
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                applicantName: "Pending Responder Applicant",
+                applicantEmail: "applicant.vja@example.com",
+                decision: "APPROVED",
+                requestedSubtype: "VOLUNTEER",
+                assignedSubtype: "VOLUNTEER",
+                reviewerUid: coordUid,
+                reviewerRole: "COORDINATOR",
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                rejectionReason: null,
+                reviewerNotes: "Verified certifications",
+                reviewedAt: serverTimestamp(),
+            });
+
+            await assertSucceeds(batch.commit());
+
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const userSnap = await getDoc(doc(context.firestore(), "users", applicantUid));
+                expect(userSnap.data()?.role).toBe("RESPONDER");
+                expect(userSnap.data()?.approvalStatus).toBe("APPROVED");
+                expect(userSnap.data()?.capabilities).toEqual(["CITIZEN", "RESPONDER"]);
+
+                const profileSnap = await getDoc(doc(context.firestore(), "responderProfiles", applicantUid));
+                expect(profileSnap.exists()).toBe(true);
+
+                const reviewSnap = await getDoc(doc(context.firestore(), "responderApplicationReviews", reviewId));
+                expect(reviewSnap.data()?.decision).toBe("APPROVED");
+            });
+        });
+
+        it("APP-02: Valid Coordinator rejects pending responder atomically with reason -> assertSucceeds", async () => {
+            const ctx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            const now = new Date();
+            const reviewId = `rev-app02-${applicantUid}-${now.getTime()}`;
+
+            const batch = writeBatch(db);
+            // 1. User transition preserving citizen capability
+            batch.update(doc(db, "users", applicantUid), {
+                role: "CITIZEN",
+                responderSubtype: null,
+                approvalStatus: "REJECTED",
+                responderApplicationStatus: "REJECTED",
+                capabilities: ["CITIZEN"],
+                citizenEnrollmentStatus: "ACTIVE",
+                rejectionReason: "Prerequisite certifications expired or unverified",
+                reviewedBy: coordUid,
+                reviewedAt: serverTimestamp(),
+                lastReviewId: reviewId,
+                updatedAt: serverTimestamp(),
+            });
+            // 2. Append-only audit record
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                applicantName: "Pending Responder Applicant",
+                applicantEmail: "applicant.vja@example.com",
+                decision: "REJECTED",
+                requestedSubtype: "VOLUNTEER",
+                assignedSubtype: null,
+                reviewerUid: coordUid,
+                reviewerRole: "COORDINATOR",
+                previousStatus: "PENDING",
+                newStatus: "REJECTED",
+                rejectionReason: "Prerequisite certifications expired or unverified",
+                reviewerNotes: "Failed verification audit",
+                reviewedAt: serverTimestamp(),
+            });
+
+            await assertSucceeds(batch.commit());
+
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const userSnap = await getDoc(doc(context.firestore(), "users", applicantUid));
+                expect(userSnap.data()?.role).toBe("CITIZEN");
+                expect(userSnap.data()?.approvalStatus).toBe("REJECTED");
+                expect(userSnap.data()?.capabilities).toEqual(["CITIZEN"]);
+                expect(userSnap.data()?.rejectionReason).toBe("Prerequisite certifications expired or unverified");
+            });
+        });
+
+        it("APP-03: Citizen attempts approval on pending responder -> assertFails (403)", async () => {
+            const ctx = testEnv.authenticatedContext(citizenUid, {
+                email: "citizen.vja@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            const now = new Date();
+            const reviewId = `rev-app03-${applicantUid}-${now.getTime()}`;
+
+            const batch = writeBatch(db);
+            batch.update(doc(db, "users", applicantUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE",
+                dutyStatus: "OFF_DUTY",
+                activeIncidentId: null,
+                reviewedBy: citizenUid,
+                approvedBy: citizenUid,
+                reviewedAt: now,
+                approvedAt: now,
+                lastReviewId: reviewId,
+                updatedAt: now,
+            });
+            batch.set(doc(db, "responderProfiles", applicantUid), {
+                uid: applicantUid,
+                displayName: "Attacker Responder",
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                updatedAt: now.toISOString(),
+            });
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                reviewerUid: citizenUid,
+                decision: "APPROVED",
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                reviewedAt: now,
+            });
+
+            await assertFails(batch.commit());
+        });
+
+        it("APP-04: Applicant attempts self-approval -> assertFails (403)", async () => {
+            const ctx = testEnv.authenticatedContext(applicantUid, {
+                email: "applicant.vja@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            const now = new Date();
+            const reviewId = `rev-app04-${applicantUid}-${now.getTime()}`;
+
+            const batch = writeBatch(db);
+            batch.update(doc(db, "users", applicantUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE",
+                dutyStatus: "OFF_DUTY",
+                activeIncidentId: null,
+                reviewedBy: applicantUid,
+                approvedBy: applicantUid,
+                reviewedAt: now,
+                approvedAt: now,
+                lastReviewId: reviewId,
+                updatedAt: now,
+            });
+            batch.set(doc(db, "responderProfiles", applicantUid), {
+                uid: applicantUid,
+                displayName: "Self Approved Responder",
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                updatedAt: now.toISOString(),
+            });
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                reviewerUid: applicantUid,
+                decision: "APPROVED",
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                reviewedAt: now,
+            });
+
+            await assertFails(batch.commit());
+        });
+
+        it("APP-05: Coordinator submits mismatched reviewedBy != request.auth.uid -> assertFails (403)", async () => {
+            const ctx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            const now = new Date();
+            const reviewId = `rev-app05-${applicantUid}-${now.getTime()}`;
+
+            const batch = writeBatch(db);
+            batch.update(doc(db, "users", applicantUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE",
+                dutyStatus: "OFF_DUTY",
+                activeIncidentId: null,
+                reviewedBy: "forged-coordinator-id", // MISMATCH
+                approvedBy: coordUid,
+                reviewedAt: now,
+                approvedAt: now,
+                lastReviewId: reviewId,
+                updatedAt: now,
+            });
+            batch.set(doc(db, "responderProfiles", applicantUid), {
+                uid: applicantUid,
+                displayName: "Pending Responder Applicant",
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                updatedAt: now.toISOString(),
+            });
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                reviewerUid: coordUid,
+                decision: "APPROVED",
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                reviewedAt: now,
+            });
+
+            await assertFails(batch.commit());
+        });
+
+        it("APP-06: Coordinator submits future timestamp -> assertFails (403)", async () => {
+            const ctx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            const futureTime = new Date(Date.now() + 120000); // 2 minutes in future
+            const reviewId = `rev-app06-${applicantUid}-${Date.now()}`;
+
+            const batch = writeBatch(db);
+            batch.update(doc(db, "users", applicantUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE",
+                dutyStatus: "OFF_DUTY",
+                activeIncidentId: null,
+                reviewedBy: coordUid,
+                approvedBy: coordUid,
+                reviewedAt: futureTime,
+                approvedAt: futureTime,
+                lastReviewId: reviewId,
+                updatedAt: futureTime,
+            });
+            batch.set(doc(db, "responderProfiles", applicantUid), {
+                uid: applicantUid,
+                displayName: "Pending Responder Applicant",
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                updatedAt: futureTime.toISOString(),
+            });
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                reviewerUid: coordUid,
+                decision: "APPROVED",
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                reviewedAt: futureTime,
+            });
+
+            await assertFails(batch.commit());
+        });
+
+        it("APP-07: Coordinator attempts approval without granting dual capabilities -> assertFails (403)", async () => {
+            const ctx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            const now = new Date();
+            const reviewId = `rev-app07-${applicantUid}-${now.getTime()}`;
+
+            const batch = writeBatch(db);
+            // VIOLATION: Granting only ['RESPONDER'] instead of ['CITIZEN', 'RESPONDER']
+            batch.update(doc(db, "users", applicantUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE",
+                dutyStatus: "OFF_DUTY",
+                activeIncidentId: null,
+                reviewedBy: coordUid,
+                approvedBy: coordUid,
+                reviewedAt: now,
+                approvedAt: now,
+                lastReviewId: reviewId,
+                updatedAt: now,
+            });
+            batch.set(doc(db, "responderProfiles", applicantUid), {
+                uid: applicantUid,
+                displayName: "Pending Responder Applicant",
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                updatedAt: now.toISOString(),
+            });
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                reviewerUid: coordUid,
+                decision: "APPROVED",
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                reviewedAt: now,
+            });
+
+            await assertFails(batch.commit());
+        });
+
+        it("APP-08: Coordinator attempts to grant COMMAND role or capability to applicant -> assertFails (403)", async () => {
+            const ctx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            const now = new Date();
+            const reviewId = `rev-app08-${applicantUid}-${now.getTime()}`;
+
+            // Attempt 1: Elevate role to COMMAND
+            const batch1 = writeBatch(db);
+            batch1.update(doc(db, "users", applicantUid), {
+                role: "COMMAND",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER"],
+                lastReviewId: reviewId,
+                reviewedBy: coordUid,
+                updatedAt: now,
+            });
+            await assertFails(batch1.commit());
+
+            // Attempt 2: Add COMMAND capability
+            const batch2 = writeBatch(db);
+            batch2.update(doc(db, "users", applicantUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER", "COMMAND"],
+                lastReviewId: reviewId,
+                reviewedBy: coordUid,
+                updatedAt: now,
+            });
+            await assertFails(batch2.commit());
+        });
+
+        it("APP-09: Coordinator attempts to approve non-pending user -> assertFails (403)", async () => {
+            const ctx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            const now = new Date();
+            const reviewId = `rev-app09-${citizenUid}-${now.getTime()}`;
+
+            // citizenUid has approvalStatus: "NOT_REQUIRED"
+            const batch = writeBatch(db);
+            batch.update(doc(db, "users", citizenUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE",
+                dutyStatus: "OFF_DUTY",
+                activeIncidentId: null,
+                reviewedBy: coordUid,
+                approvedBy: coordUid,
+                reviewedAt: now,
+                approvedAt: now,
+                lastReviewId: reviewId,
+                updatedAt: now,
+            });
+            batch.set(doc(db, "responderProfiles", citizenUid), {
+                uid: citizenUid,
+                displayName: "Vijayawada Citizen",
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                updatedAt: now.toISOString(),
+            });
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: citizenUid,
+                reviewerUid: coordUid,
+                decision: "APPROVED",
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                reviewedAt: now,
+            });
+
+            await assertFails(batch.commit());
+        });
+
+        it("APP-10: Coordinator attempts to demote or re-reject already approved responder -> assertFails (403)", async () => {
+            const approvedUid = "resp-approved-already-01";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                const now = new Date();
+                await setDoc(doc(fdb, "users", approvedUid), {
+                    uid: approvedUid,
+                    displayName: "Already Approved Responder",
+                    email: "already.approved@example.com",
+                    role: "RESPONDER",
+                    responderSubtype: "VOLUNTEER",
+                    commandLevel: null,
+                    capabilities: ["CITIZEN", "RESPONDER"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    responderApplicationStatus: "APPROVED",
+                    approvalStatus: "APPROVED",
+                    dutyStatus: "OFF_DUTY",
+                    activeIncidentId: null,
+                    accountStatus: "ACTIVE",
+                    phoneVerified: false,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                });
+            });
+
+            const ctx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            const now = new Date();
+            const reviewId = `rev-app10-${approvedUid}-${now.getTime()}`;
+
+            // Coordinator attempts to change approvalStatus from APPROVED to REJECTED
+            const batch = writeBatch(db);
+            batch.update(doc(db, "users", approvedUid), {
+                role: "CITIZEN",
+                responderSubtype: null,
+                approvalStatus: "REJECTED",
+                responderApplicationStatus: "REJECTED",
+                capabilities: ["CITIZEN"],
+                rejectionReason: "Demoted due to inactivity",
+                reviewedBy: coordUid,
+                reviewedAt: now,
+                lastReviewId: reviewId,
+                updatedAt: now,
+            });
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: approvedUid,
+                reviewerUid: coordUid,
+                decision: "REJECTED",
+                previousStatus: "APPROVED",
+                newStatus: "REJECTED",
+                rejectionReason: "Demoted due to inactivity",
+                reviewedAt: now,
+            });
+
+            await assertFails(batch.commit());
+        });
+
+        it("APP-11: Coordinator attempts to approve suspended applicant -> assertFails (403)", async () => {
+            const suspendedUid = "appl-suspended-wf-01";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                const now = new Date();
+                await setDoc(doc(fdb, "users", suspendedUid), {
+                    uid: suspendedUid,
+                    displayName: "Suspended Applicant",
+                    email: "suspended@example.com",
+                    role: "CITIZEN",
+                    commandLevel: null,
+                    responderSubtype: null,
+                    requestedRole: "RESPONDER",
+                    requestedResponderSubtype: "VOLUNTEER",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    responderApplicationStatus: "PENDING",
+                    approvalStatus: "PENDING",
+                    dutyStatus: null,
+                    activeIncidentId: null,
+                    accountStatus: "SUSPENDED", // SUSPENDED
+                    phoneVerified: false,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                });
+            });
+
+            const ctx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            const now = new Date();
+            const reviewId = `rev-app11-${suspendedUid}-${now.getTime()}`;
+
+            const batch = writeBatch(db);
+            batch.update(doc(db, "users", suspendedUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE",
+                dutyStatus: "OFF_DUTY",
+                activeIncidentId: null,
+                reviewedBy: coordUid,
+                approvedBy: coordUid,
+                reviewedAt: now,
+                approvedAt: now,
+                lastReviewId: reviewId,
+                updatedAt: now,
+            });
+            batch.set(doc(db, "responderProfiles", suspendedUid), {
+                uid: suspendedUid,
+                displayName: "Suspended Applicant",
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                updatedAt: now.toISOString(),
+            });
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: suspendedUid,
+                reviewerUid: coordUid,
+                decision: "APPROVED",
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                reviewedAt: now,
+            });
+
+            await assertFails(batch.commit());
+        });
+
+        it("APP-12: Coordinator attempts to approve unverified applicant -> assertFails (403)", async () => {
+            const unverifiedUid = "appl-unverified-wf-01";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                const now = new Date();
+                await setDoc(doc(fdb, "users", unverifiedUid), {
+                    uid: unverifiedUid,
+                    displayName: "Unverified Applicant",
+                    email: "unverified@example.com",
+                    role: "CITIZEN",
+                    commandLevel: null,
+                    responderSubtype: null,
+                    requestedRole: "RESPONDER",
+                    requestedResponderSubtype: "VOLUNTEER",
+                    capabilities: [],
+                    citizenEnrollmentStatus: "INACTIVE",
+                    responderApplicationStatus: "PENDING",
+                    approvalStatus: "PENDING",
+                    dutyStatus: null,
+                    activeIncidentId: null,
+                    accountStatus: "ACTIVE",
+                    phoneVerified: false,
+                    emailVerified: false, // UNVERIFIED
+                    createdAt: now,
+                    updatedAt: now,
+                });
+            });
+
+            const ctx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+            const now = new Date();
+            const reviewId = `rev-app12-${unverifiedUid}-${now.getTime()}`;
+
+            const batch = writeBatch(db);
+            batch.update(doc(db, "users", unverifiedUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE",
+                dutyStatus: "OFF_DUTY",
+                activeIncidentId: null,
+                reviewedBy: coordUid,
+                approvedBy: coordUid,
+                reviewedAt: now,
+                approvedAt: now,
+                lastReviewId: reviewId,
+                updatedAt: now,
+            });
+            batch.set(doc(db, "responderProfiles", unverifiedUid), {
+                uid: unverifiedUid,
+                displayName: "Unverified Applicant",
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                updatedAt: now.toISOString(),
+            });
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: unverifiedUid,
+                reviewerUid: coordUid,
+                decision: "APPROVED",
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                reviewedAt: now,
+            });
+
+            await assertFails(batch.commit());
+        });
+
+        it("APP-13: Client attempts to modify or delete audit log in responderApplicationReviews -> assertFails (403)", async () => {
+            const reviewId = "rev-audit-immutable-01";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "responderApplicationReviews", reviewId), {
+                    id: reviewId,
+                    applicantUid: applicantUid,
+                    reviewerUid: coordUid,
+                    decision: "APPROVED",
+                    previousStatus: "PENDING",
+                    newStatus: "APPROVED",
+                    reviewedAt: new Date(),
+                });
+            });
+
+            // 1. Coordinator attempts update on audit record
+            const coordCtx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator@vmc.gov.in",
+                email_verified: true,
+            });
+            await assertFails(updateDoc(doc(coordCtx.firestore(), "responderApplicationReviews", reviewId), {
+                decision: "REJECTED",
+            }));
+
+            // 2. Coordinator attempts delete on audit record
+            await assertFails(deleteDoc(doc(coordCtx.firestore(), "responderApplicationReviews", reviewId)));
+
+            // 3. Admin attempts update on audit record
+            const adminCtx = testEnv.authenticatedContext(adminUid, {
+                email: "admin@apsdma.gov.in",
+                email_verified: true,
+            });
+            await assertFails(updateDoc(doc(adminCtx.firestore(), "responderApplicationReviews", reviewId), {
+                decision: "REJECTED",
+            }));
+
+            // 4. Admin attempts delete on audit record
+            await assertFails(deleteDoc(doc(adminCtx.firestore(), "responderApplicationReviews", reviewId)));
+        });
+
+        it("APP-14: Administrator attempts generic profile update to force approval without following coordinator approval contract -> assertFails (403)", async () => {
+            const adminCtx = testEnv.authenticatedContext(adminUid, {
+                email: "admin@apsdma.gov.in",
+                email_verified: true,
+            });
+            const db = adminCtx.firestore();
+
+            // Administrator attempting generic updateDoc on approvalStatus
+            await assertFails(updateDoc(doc(db, "users", applicantUid), {
+                approvalStatus: "APPROVED",
+                updatedAt: new Date(),
+            }));
+        });
+
+        it("APP-15: Fabricated audit-only write without corresponding applicant transition -> assertFails (403)", async () => {
+            const coordCtx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = coordCtx.firestore();
+            const now = new Date();
+            const reviewId = `rev-standalone-${applicantUid}-${now.getTime()}`;
+
+            // Standalone write to responderApplicationReviews without user doc update in same batch
+            await assertFails(setDoc(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                reviewerUid: coordUid,
+                decision: "APPROVED",
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                reviewedAt: now,
+            }));
+        });
+
+        it("APP-16: Decision on applicant without corresponding valid audit entry in same batch -> assertFails (403)", async () => {
+            const coordCtx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = coordCtx.firestore();
+            const now = new Date();
+
+            // Coordinator attempts user update with non-existent or omitted audit record
+            await assertFails(updateDoc(doc(db, "users", applicantUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE",
+                dutyStatus: "OFF_DUTY",
+                activeIncidentId: null,
+                reviewedBy: coordUid,
+                approvedBy: coordUid,
+                reviewedAt: now,
+                approvedAt: now,
+                lastReviewId: "non-existent-review-id",
+                updatedAt: now,
+            }));
+        });
+
+        it("APP-17: Arbitrary responderProfiles creation by Command without approval transition -> assertFails (403)", async () => {
+            const coordCtx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator@vmc.gov.in",
+                email_verified: true,
+            });
+            const db = coordCtx.firestore();
+            const now = new Date();
+
+            // Coordinator attempts arbitrary standalone responderProfiles creation
+            await assertFails(setDoc(doc(db, "responderProfiles", applicantUid), {
+                uid: applicantUid,
+                displayName: "Arbitrary Profile Creation",
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                updatedAt: now.toISOString(),
+            }));
+        });
+    });
+
+    // =========================================================================
+    // Phase 1 Task 2: Security Remediation (REM-01 - REM-07)
+    // =========================================================================
+    describe("Phase 1 Task 2: Security Remediation (REM-01 - REM-07)", () => {
+        const coordUid = "coord-rem-01";
+        const adminUid = "admin-rem-01";
+        const applicantUid = "appl-rem-01";
+        const raceApplicantUid = "appl-rem-race-01";
+
+        beforeEach(async () => {
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                const now = new Date();
+
+                // Coordinator profile
+                await setDoc(doc(fdb, "users", coordUid), {
+                    uid: coordUid,
+                    displayName: "Operations Coordinator",
+                    email: "coordinator.rem@beaconmesh.org",
+                    role: "COMMAND",
+                    commandLevel: "COORDINATOR",
+                    capabilities: ["COMMAND"],
+                    citizenEnrollmentStatus: "INACTIVE",
+                    responderApplicationStatus: "NOT_APPLIED",
+                    approvalStatus: "NOT_REQUIRED",
+                    accountStatus: "ACTIVE",
+                    phoneVerified: false,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                });
+
+                // Administrator profile
+                await setDoc(doc(fdb, "users", adminUid), {
+                    uid: adminUid,
+                    displayName: "System Administrator",
+                    email: "admin.rem@beaconmesh.org",
+                    role: "COMMAND",
+                    commandLevel: "ADMINISTRATOR",
+                    capabilities: ["COMMAND"],
+                    citizenEnrollmentStatus: "INACTIVE",
+                    responderApplicationStatus: "NOT_APPLIED",
+                    approvalStatus: "NOT_REQUIRED",
+                    accountStatus: "ACTIVE",
+                    phoneVerified: false,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                });
+
+                // Standard Pending Applicant profile
+                await setDoc(doc(fdb, "users", applicantUid), {
+                    uid: applicantUid,
+                    displayName: "Pending Responder Gamma",
+                    email: "applicant.rem@example.com",
+                    role: "CITIZEN",
+                    commandLevel: null,
+                    responderSubtype: null,
+                    requestedRole: "RESPONDER",
+                    requestedResponderSubtype: "VOLUNTEER",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    responderApplicationStatus: "PENDING",
+                    approvalStatus: "PENDING",
+                    dutyStatus: null,
+                    activeIncidentId: null,
+                    accountStatus: "ACTIVE",
+                    phoneVerified: false,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                });
+
+                // Race-test Pending Applicant profile
+                await setDoc(doc(fdb, "users", raceApplicantUid), {
+                    uid: raceApplicantUid,
+                    displayName: "Race Pending Responder",
+                    email: "race.applicant@example.com",
+                    role: "CITIZEN",
+                    commandLevel: null,
+                    responderSubtype: null,
+                    requestedRole: "RESPONDER",
+                    requestedResponderSubtype: "VOLUNTEER",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    responderApplicationStatus: "PENDING",
+                    approvalStatus: "PENDING",
+                    dutyStatus: null,
+                    activeIncidentId: null,
+                    accountStatus: "ACTIVE",
+                    phoneVerified: false,
+                    emailVerified: true,
+                    createdAt: now,
+                    updatedAt: now,
+                });
+            });
+        });
+
+        it("REM-01: Administrator can approve verified pending responder with reviewerName and reviewerDesignation -> assertSucceeds", async () => {
+            const adminCtx = testEnv.authenticatedContext(adminUid, {
+                email: "admin.rem@beaconmesh.org",
+                email_verified: true,
+                role: "COMMAND",
+                commandLevel: "ADMINISTRATOR",
+                accountStatus: "ACTIVE",
+            });
+            const db = adminCtx.firestore();
+            const reviewId = `rev-rem01-${applicantUid}-${Date.now()}`;
+            const batch = writeBatch(db);
+
+            batch.update(doc(db, "users", applicantUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE",
+                dutyStatus: "OFF_DUTY",
+                activeIncidentId: null,
+                reviewedBy: adminUid,
+                approvedBy: adminUid,
+                reviewedAt: serverTimestamp(),
+                approvedAt: serverTimestamp(),
+                lastReviewId: reviewId,
+                updatedAt: serverTimestamp(),
+            });
+
+            batch.set(doc(db, "responderProfiles", applicantUid), {
+                uid: applicantUid,
+                displayName: "Pending Responder Gamma",
+                email: "applicant.rem@example.com",
+                phoneNumber: null,
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                certifications: ["Basic First Aid"],
+                skills: ["Search and Rescue"],
+                updatedAt: new Date().toISOString(),
+            });
+
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                applicantName: "Pending Responder Gamma",
+                applicantEmail: "applicant.rem@example.com",
+                decision: "APPROVED",
+                requestedSubtype: "VOLUNTEER",
+                assignedSubtype: "VOLUNTEER",
+                reviewerUid: adminUid,
+                reviewerName: "Command Admin",
+                reviewerRole: "ADMINISTRATOR",
+                reviewerDesignation: "Command Administrator",
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                rejectionReason: null,
+                reviewerNotes: "Administrator approval with audit metadata",
+                reviewedAt: serverTimestamp(),
+            });
+
+            await assertSucceeds(batch.commit());
+        });
+
+        it("REM-02: Administrator can reject verified pending responder with audit record -> assertSucceeds", async () => {
+            const adminCtx = testEnv.authenticatedContext(adminUid, {
+                email: "admin.rem@beaconmesh.org",
+                email_verified: true,
+                role: "COMMAND",
+                commandLevel: "ADMINISTRATOR",
+                accountStatus: "ACTIVE",
+            });
+            const db = adminCtx.firestore();
+            const reviewId = `rev-rem02-${applicantUid}-${Date.now()}`;
+            const batch = writeBatch(db);
+
+            batch.update(doc(db, "users", applicantUid), {
+                role: "CITIZEN",
+                responderSubtype: null,
+                approvalStatus: "REJECTED",
+                responderApplicationStatus: "REJECTED",
+                capabilities: ["CITIZEN"],
+                citizenEnrollmentStatus: "ACTIVE",
+                rejectionReason: "Administrator rejection attempt",
+                reviewedBy: adminUid,
+                reviewedAt: serverTimestamp(),
+                lastReviewId: reviewId,
+                updatedAt: serverTimestamp(),
+            });
+
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                applicantName: "Pending Responder Gamma",
+                applicantEmail: "applicant.rem@example.com",
+                decision: "REJECTED",
+                requestedSubtype: "VOLUNTEER",
+                assignedSubtype: null,
+                reviewerUid: adminUid,
+                reviewerName: "Command Admin",
+                reviewerRole: "ADMINISTRATOR",
+                reviewerDesignation: "Command Administrator",
+                previousStatus: "PENDING",
+                newStatus: "REJECTED",
+                rejectionReason: "Incomplete credentials",
+                reviewerNotes: "Rejected with audit metadata",
+                reviewedAt: serverTimestamp(),
+            });
+
+            await assertSucceeds(batch.commit());
+        });
+
+        it("REM-03: Coordinator attempts approval with forged reviewerRole ('ADMINISTRATOR' / 'SUPER_ADMIN') -> assertFails (403)", async () => {
+            const coordCtx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator.rem@beaconmesh.org",
+                email_verified: true,
+                role: "COMMAND",
+                commandLevel: "COORDINATOR",
+                accountStatus: "ACTIVE",
+            });
+            const db = coordCtx.firestore();
+            const reviewId = `rev-rem03-${applicantUid}-${Date.now()}`;
+            const batch = writeBatch(db);
+
+            batch.update(doc(db, "users", applicantUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE",
+                dutyStatus: "OFF_DUTY",
+                activeIncidentId: null,
+                reviewedBy: coordUid,
+                approvedBy: coordUid,
+                reviewedAt: serverTimestamp(),
+                approvedAt: serverTimestamp(),
+                lastReviewId: reviewId,
+                updatedAt: serverTimestamp(),
+            });
+
+            batch.set(doc(db, "responderProfiles", applicantUid), {
+                uid: applicantUid,
+                displayName: "Pending Responder Gamma",
+                email: "applicant.rem@example.com",
+                phoneNumber: null,
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                certifications: ["Basic First Aid"],
+                skills: ["Search and Rescue"],
+                updatedAt: new Date().toISOString(),
+            });
+
+            // Forged reviewerRole != "COORDINATOR"
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                applicantName: "Pending Responder Gamma",
+                applicantEmail: "applicant.rem@example.com",
+                decision: "APPROVED",
+                requestedSubtype: "VOLUNTEER",
+                assignedSubtype: "VOLUNTEER",
+                reviewerUid: coordUid,
+                reviewerRole: "SUPER_ADMIN", // FORGED
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                rejectionReason: null,
+                reviewerNotes: "Role forgery test",
+                reviewedAt: serverTimestamp(),
+            });
+
+            await assertFails(batch.commit());
+        });
+
+        it("REM-04: Coordinator attempts approval with client backdated timestamp -> assertFails (403)", async () => {
+            const coordCtx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator.rem@beaconmesh.org",
+                email_verified: true,
+                role: "COMMAND",
+                commandLevel: "COORDINATOR",
+                accountStatus: "ACTIVE",
+            });
+            const db = coordCtx.firestore();
+            const backdatedTime = new Date(Date.now() - 3600000); // 1 hour ago
+            const reviewId = `rev-rem04-${applicantUid}-${Date.now()}`;
+            const batch = writeBatch(db);
+
+            batch.update(doc(db, "users", applicantUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE",
+                dutyStatus: "OFF_DUTY",
+                activeIncidentId: null,
+                reviewedBy: coordUid,
+                approvedBy: coordUid,
+                reviewedAt: backdatedTime, // Backdated client timestamp
+                approvedAt: backdatedTime,
+                lastReviewId: reviewId,
+                updatedAt: backdatedTime,
+            });
+
+            batch.set(doc(db, "responderProfiles", applicantUid), {
+                uid: applicantUid,
+                displayName: "Pending Responder Gamma",
+                email: "applicant.rem@example.com",
+                phoneNumber: null,
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                certifications: ["Basic First Aid"],
+                skills: ["Search and Rescue"],
+                updatedAt: new Date().toISOString(),
+            });
+
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                applicantName: "Pending Responder Gamma",
+                applicantEmail: "applicant.rem@example.com",
+                decision: "APPROVED",
+                requestedSubtype: "VOLUNTEER",
+                assignedSubtype: "VOLUNTEER",
+                reviewerUid: coordUid,
+                reviewerRole: "COORDINATOR",
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                rejectionReason: null,
+                reviewerNotes: "Backdated review attempt",
+                reviewedAt: backdatedTime, // Backdated client timestamp
+            });
+
+            await assertFails(batch.commit());
+        });
+
+        it("REM-05: Coordinator attempts approval with mismatched timestamps between user and review -> assertFails (403)", async () => {
+            const coordCtx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator.rem@beaconmesh.org",
+                email_verified: true,
+                role: "COMMAND",
+                commandLevel: "COORDINATOR",
+                accountStatus: "ACTIVE",
+            });
+            const db = coordCtx.firestore();
+            const reviewId = `rev-rem05-${applicantUid}-${Date.now()}`;
+            const batch = writeBatch(db);
+
+            batch.update(doc(db, "users", applicantUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE",
+                dutyStatus: "OFF_DUTY",
+                activeIncidentId: null,
+                reviewedBy: coordUid,
+                approvedBy: coordUid,
+                reviewedAt: serverTimestamp(),
+                approvedAt: serverTimestamp(),
+                lastReviewId: reviewId,
+                updatedAt: serverTimestamp(),
+            });
+
+            batch.set(doc(db, "responderProfiles", applicantUid), {
+                uid: applicantUid,
+                displayName: "Pending Responder Gamma",
+                email: "applicant.rem@example.com",
+                phoneNumber: null,
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                certifications: ["Basic First Aid"],
+                skills: ["Search and Rescue"],
+                updatedAt: new Date().toISOString(),
+            });
+
+            // Mismatched reviewedAt: review doc has fixed past date while user doc uses serverTimestamp
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                applicantName: "Pending Responder Gamma",
+                applicantEmail: "applicant.rem@example.com",
+                decision: "APPROVED",
+                requestedSubtype: "VOLUNTEER",
+                assignedSubtype: "VOLUNTEER",
+                reviewerUid: coordUid,
+                reviewerRole: "COORDINATOR",
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                rejectionReason: null,
+                reviewerNotes: "Mismatched timestamp test",
+                reviewedAt: new Date(Date.now() - 10000), // MISMATCH
+            });
+
+            await assertFails(batch.commit());
+        });
+
+        it("REM-06: Coordinator attempts rejection with approvedAt timestamp -> assertFails (403)", async () => {
+            const coordCtx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator.rem@beaconmesh.org",
+                email_verified: true,
+                role: "COMMAND",
+                commandLevel: "COORDINATOR",
+                accountStatus: "ACTIVE",
+            });
+            const db = coordCtx.firestore();
+            const reviewId = `rev-rem06-${applicantUid}-${Date.now()}`;
+            const batch = writeBatch(db);
+
+            batch.update(doc(db, "users", applicantUid), {
+                role: "CITIZEN",
+                responderSubtype: null,
+                approvalStatus: "REJECTED",
+                responderApplicationStatus: "REJECTED",
+                capabilities: ["CITIZEN"],
+                citizenEnrollmentStatus: "ACTIVE",
+                rejectionReason: "Invalid application submission",
+                reviewedBy: coordUid,
+                approvedAt: serverTimestamp(), // FORBIDDEN ON REJECTION
+                reviewedAt: serverTimestamp(),
+                lastReviewId: reviewId,
+                updatedAt: serverTimestamp(),
+            });
+
+            batch.set(doc(db, "responderApplicationReviews", reviewId), {
+                id: reviewId,
+                applicantUid: applicantUid,
+                applicantName: "Pending Responder Gamma",
+                applicantEmail: "applicant.rem@example.com",
+                decision: "REJECTED",
+                requestedSubtype: "VOLUNTEER",
+                assignedSubtype: null,
+                reviewerUid: coordUid,
+                reviewerRole: "COORDINATOR",
+                previousStatus: "PENDING",
+                newStatus: "REJECTED",
+                rejectionReason: "Invalid application submission",
+                reviewerNotes: "Rejection with approvedAt test",
+                reviewedAt: serverTimestamp(),
+            });
+
+            await assertFails(batch.commit());
+        });
+
+        it("REM-07: Concurrent approval and rejection decision race against same pending applicant -> exactly one decision wins", async () => {
+            const coordCtx = testEnv.authenticatedContext(coordUid, {
+                email: "coordinator.rem@beaconmesh.org",
+                email_verified: true,
+                role: "COMMAND",
+                commandLevel: "COORDINATOR",
+                accountStatus: "ACTIVE",
+            });
+            const db = coordCtx.firestore();
+            const nowTime = Date.now();
+            const approveReviewId = `rev-race-app-${raceApplicantUid}-${nowTime}`;
+            const rejectReviewId = `rev-race-rej-${raceApplicantUid}-${nowTime}`;
+
+            // Competing Batch 1: Approval
+            const approveBatch = writeBatch(db);
+            approveBatch.update(doc(db, "users", raceApplicantUid), {
+                role: "RESPONDER",
+                responderSubtype: "VOLUNTEER",
+                approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED",
+                capabilities: ["CITIZEN", "RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE",
+                dutyStatus: "OFF_DUTY",
+                activeIncidentId: null,
+                reviewedBy: coordUid,
+                approvedBy: coordUid,
+                reviewedAt: serverTimestamp(),
+                approvedAt: serverTimestamp(),
+                lastReviewId: approveReviewId,
+                updatedAt: serverTimestamp(),
+            });
+            approveBatch.set(doc(db, "responderProfiles", raceApplicantUid), {
+                uid: raceApplicantUid,
+                displayName: "Race Pending Responder",
+                email: "race.applicant@example.com",
+                phoneNumber: null,
+                responderSubtype: "VOLUNTEER",
+                availabilityStatus: "UNAVAILABLE",
+                dutyStatus: "OFF_DUTY",
+                certifications: ["Emergency First Aid"],
+                skills: ["Flood Evacuation"],
+                updatedAt: new Date().toISOString(),
+            });
+            approveBatch.set(doc(db, "responderApplicationReviews", approveReviewId), {
+                id: approveReviewId,
+                applicantUid: raceApplicantUid,
+                applicantName: "Race Pending Responder",
+                applicantEmail: "race.applicant@example.com",
+                decision: "APPROVED",
+                requestedSubtype: "VOLUNTEER",
+                assignedSubtype: "VOLUNTEER",
+                reviewerUid: coordUid,
+                reviewerRole: "COORDINATOR",
+                previousStatus: "PENDING",
+                newStatus: "APPROVED",
+                rejectionReason: null,
+                reviewerNotes: "Concurrent race test approval",
+                reviewedAt: serverTimestamp(),
+            });
+
+            // Competing Batch 2: Rejection
+            const rejectBatch = writeBatch(db);
+            rejectBatch.update(doc(db, "users", raceApplicantUid), {
+                role: "CITIZEN",
+                responderSubtype: null,
+                approvalStatus: "REJECTED",
+                responderApplicationStatus: "REJECTED",
+                capabilities: ["CITIZEN"],
+                citizenEnrollmentStatus: "ACTIVE",
+                rejectionReason: "Competing concurrent rejection",
+                reviewedBy: coordUid,
+                reviewedAt: serverTimestamp(),
+                lastReviewId: rejectReviewId,
+                updatedAt: serverTimestamp(),
+            });
+            rejectBatch.set(doc(db, "responderApplicationReviews", rejectReviewId), {
+                id: rejectReviewId,
+                applicantUid: raceApplicantUid,
+                applicantName: "Race Pending Responder",
+                applicantEmail: "race.applicant@example.com",
+                decision: "REJECTED",
+                requestedSubtype: "VOLUNTEER",
+                assignedSubtype: null,
+                reviewerUid: coordUid,
+                reviewerRole: "COORDINATOR",
+                previousStatus: "PENDING",
+                newStatus: "REJECTED",
+                rejectionReason: "Competing concurrent rejection",
+                reviewerNotes: "Concurrent race test rejection",
+                reviewedAt: serverTimestamp(),
+            });
+
+            // Fire both commits concurrently
+            const results = await Promise.allSettled([approveBatch.commit(), rejectBatch.commit()]);
+
+            const fulfilled = results.filter((r) => r.status === "fulfilled");
+            const rejected = results.filter((r) => r.status === "rejected");
+
+            // Guarantee: Exactly one batch succeeds and exactly one batch fails closed
+            expect(fulfilled).toHaveLength(1);
+            expect(rejected).toHaveLength(1);
+
+            // Verify final state matches the winning batch
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const finalDb = context.firestore();
+                const userSnap = await getDoc(doc(finalDb, "users", raceApplicantUid));
+                const finalUserData = userSnap.data();
+
+                const approveReviewSnap = await getDoc(doc(finalDb, "responderApplicationReviews", approveReviewId));
+                const rejectReviewSnap = await getDoc(doc(finalDb, "responderApplicationReviews", rejectReviewId));
+                const profileSnap = await getDoc(doc(finalDb, "responderProfiles", raceApplicantUid));
+
+                if (finalUserData?.approvalStatus === "APPROVED") {
+                    // Approval won the race
+                    expect(finalUserData?.role).toBe("RESPONDER");
+                    expect(finalUserData?.capabilities).toEqual(["CITIZEN", "RESPONDER"]);
+                    expect(finalUserData?.lastReviewId).toBe(approveReviewId);
+                    expect(approveReviewSnap.exists()).toBe(true);
+                    expect(rejectReviewSnap.exists()).toBe(false);
+                    expect(profileSnap.exists()).toBe(true);
+                } else {
+                    // Rejection won the race
+                    expect(finalUserData?.approvalStatus).toBe("REJECTED");
+                    expect(finalUserData?.role).toBe("CITIZEN");
+                    expect(finalUserData?.capabilities).toEqual(["CITIZEN"]);
+                    expect(finalUserData?.lastReviewId).toBe(rejectReviewId);
+                    expect(rejectReviewSnap.exists()).toBe(true);
+                    expect(approveReviewSnap.exists()).toBe(false);
+                    expect(profileSnap.exists()).toBe(false); // No orphan profile on rejection
+                }
+            });
+        });
+    });
+
+    describe("Task 3: Google Sign-In Existing Accounts Only Security & Data Integrity", () => {
+        it("GGL-EMU-01: rejects writes to users/{uid} by unverified or unregistered Google caller attempting self-provisioning", async () => {
+            const uid = "unregistered-google-user-emu01";
+            const unverifiedGoogleUser = testEnv.authenticatedContext(uid, {
+                email: "unreg@example.com",
+                email_verified: false,
+            });
+            const db = unverifiedGoogleUser.firestore();
+            await assertFails(setDoc(doc(db, "users", uid), {
+                uid,
+                email: "unreg@example.com",
+                role: "CITIZEN",
+                capabilities: ["CITIZEN"],
+                accountStatus: "ACTIVE",
+            }));
+        });
+
+        it("GGL-EMU-02: allows existing registered Google user to update legitimate fields (displayName, photoURL, lastLoginAt)", async () => {
+            const uid = "registered-google-citizen-emu02";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const adminDb = context.firestore();
+                await setDoc(doc(adminDb, "users", uid), {
+                    uid,
+                    displayName: "Old Name",
+                    email: "citizen.emu02@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    responderApplicationStatus: "NOT_APPLIED",
+                    registrationPath: "CITIZEN",
+                    approvalStatus: "NOT_REQUIRED",
+                    phoneVerified: false,
+                    emailVerified: true,
+                    accountStatus: "ACTIVE",
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+
+            const authedGoogleUser = testEnv.authenticatedContext(uid, {
+                email: "citizen.emu02@example.com",
+                email_verified: true,
+            });
+            const db = authedGoogleUser.firestore();
+            await assertSucceeds(updateDoc(doc(db, "users", uid), {
+                displayName: "New Google Name",
+                photoURL: "https://example.com/photo.jpg",
+                lastLoginAt: new Date(),
+                updatedAt: new Date(),
+            }));
+        });
+
+        it("GGL-EMU-03: blocks existing registered Google user from escalating role or commandLevel via update", async () => {
+            const uid = "citizen-escalate-attempt-emu03";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const adminDb = context.firestore();
+                await setDoc(doc(adminDb, "users", uid), {
+                    uid,
+                    displayName: "Normal Citizen",
+                    email: "citizen.emu03@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    responderApplicationStatus: "NOT_APPLIED",
+                    registrationPath: "CITIZEN",
+                    approvalStatus: "NOT_REQUIRED",
+                    phoneVerified: false,
+                    emailVerified: true,
+                    accountStatus: "ACTIVE",
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+
+            const authedGoogleUser = testEnv.authenticatedContext(uid, {
+                email: "citizen.emu03@example.com",
+                email_verified: true,
+            });
+            const db = authedGoogleUser.firestore();
+            await assertFails(updateDoc(doc(db, "users", uid), {
+                role: "COMMAND",
+                commandLevel: "ADMINISTRATOR",
+            }));
+        });
+
+        it("GGL-EMU-04: blocks suspended Google user from updating lastLoginAt or profile fields", async () => {
+            const uid = "suspended-google-user-emu04";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const adminDb = context.firestore();
+                await setDoc(doc(adminDb, "users", uid), {
+                    uid,
+                    displayName: "Suspended User",
+                    email: "suspended.emu04@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    responderApplicationStatus: "NOT_APPLIED",
+                    registrationPath: "CITIZEN",
+                    approvalStatus: "NOT_REQUIRED",
+                    phoneVerified: false,
+                    emailVerified: true,
+                    accountStatus: "SUSPENDED",
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+
+            const authedGoogleUser = testEnv.authenticatedContext(uid, {
+                email: "suspended.emu04@example.com",
+                email_verified: true,
+            });
+            const db = authedGoogleUser.firestore();
+            await assertFails(updateDoc(doc(db, "users", uid), {
+                lastLoginAt: new Date(),
+                updatedAt: new Date(),
+            }));
+        });
+
+        it("GGL-EMU-05: unregistered Google identity attempting direct incidents read is denied", async () => {
+            const uid = "unregistered-google-user-05";
+            const unregUser = testEnv.authenticatedContext(uid, {
+                email: "unregistered.05@example.com",
+                email_verified: true,
+            });
+            const db = unregUser.firestore();
+            await assertFails(getDoc(doc(db, "incidents", "some-incident-id")));
+        });
+
+        it("GGL-EMU-06: unregistered Google identity attempting direct incidents create is denied", async () => {
+            const uid = "unregistered-google-user-06";
+            const unregUser = testEnv.authenticatedContext(uid, {
+                email: "unregistered.06@example.com",
+                email_verified: true,
+            });
+            const db = unregUser.firestore();
+            await assertFails(setDoc(doc(db, "incidents", "inc-unreg-06"), {
+                id: "inc-unreg-06",
+                type: "Medical",
+                place: "Downtown",
+                description: "Created by unregistered Google user",
+                status: "Waiting for connection",
+                priority: "Critical",
+                createdBy: uid,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+            }));
+        });
+
+        it("GGL-EMU-07: Google-verified token with unverified BeaconMesh profile is denied reading and creating incidents", async () => {
+            const uid = "google-unverified-profile-emu07";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const adminDb = context.firestore();
+                await setDoc(doc(adminDb, "users", uid), {
+                    uid,
+                    displayName: "Google Unverified Profile User",
+                    email: "unverified.emu07@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    responderApplicationStatus: "NOT_APPLIED",
+                    registrationPath: "CITIZEN",
+                    approvalStatus: "NOT_REQUIRED",
+                    phoneVerified: false,
+                    emailVerified: false, // Profile unverified
+                    accountStatus: "ACTIVE",
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+
+            const authedGoogleUser = testEnv.authenticatedContext(uid, {
+                email: "unverified.emu07@example.com",
+                email_verified: true, // Google token is verified
+            });
+            const db = authedGoogleUser.firestore();
+
+            // Direct read is denied
+            await assertFails(getDoc(doc(db, "incidents", "some-incident-id")));
+
+            // Direct create is denied
+            await assertFails(setDoc(doc(db, "incidents", "inc-unverified-07"), {
+                id: "inc-unverified-07",
+                type: "Medical",
+                place: "Downtown",
+                description: "Attempted by unverified profile user",
+                status: "Waiting for connection",
+                priority: "Critical",
+                createdBy: uid,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+            }));
+        });
+
+        it("GGL-EMU-08: Google user attempting self-verification mirror manipulation is denied", async () => {
+            const uid = "google-mirror-tamper-emu08";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const adminDb = context.firestore();
+                await setDoc(doc(adminDb, "users", uid), {
+                    uid,
+                    displayName: "Mirror Tamper User",
+                    email: "tamper.emu08@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    responderApplicationStatus: "NOT_APPLIED",
+                    registrationPath: "CITIZEN",
+                    approvalStatus: "NOT_REQUIRED",
+                    phoneVerified: false,
+                    emailVerified: false,
+                    accountStatus: "ACTIVE",
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+
+            const authedGoogleUser = testEnv.authenticatedContext(uid, {
+                email: "tamper.emu08@example.com",
+                email_verified: true, // Google token is verified
+            });
+            const db = authedGoogleUser.firestore();
+
+            // Self-modification of emailVerified is strictly forbidden
+            await assertFails(updateDoc(doc(db, "users", uid), {
+                emailVerified: true,
+                emailVerifiedAt: new Date(),
+                updatedAt: new Date(),
+            }));
+        });
+
+        it("GGL-EMU-09: legitimate verified active Citizen with dual confirmation is allowed to read and create incidents", async () => {
+            const uid = "google-legit-citizen-emu09";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const adminDb = context.firestore();
+                await setDoc(doc(adminDb, "users", uid), {
+                    uid,
+                    displayName: "Legitimate Citizen",
+                    email: "legit.emu09@example.com",
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    responderApplicationStatus: "NOT_APPLIED",
+                    registrationPath: "CITIZEN",
+                    approvalStatus: "NOT_REQUIRED",
+                    phoneVerified: false,
+                    emailVerified: true, // Profile mirror verified
+                    accountStatus: "ACTIVE",
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+                await setDoc(doc(adminDb, "incidents", "inc-legit-09"), {
+                    id: "inc-legit-09",
+                    type: "Medical",
+                    place: "Downtown",
+                    description: "Legitimate incident",
+                    status: "Waiting for connection",
+                    priority: "Critical",
+                    createdBy: uid,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+
+            const authedGoogleUser = testEnv.authenticatedContext(uid, {
+                email: "legit.emu09@example.com",
+                email_verified: true, // Token claim verified
+            });
+            const db = authedGoogleUser.firestore();
+
+            // Read succeeds
+            await assertSucceeds(getDoc(doc(db, "incidents", "inc-legit-09")));
+
+            // Create succeeds
+            await assertSucceeds(setDoc(doc(db, "incidents", "inc-legit-created-09"), {
+                id: "inc-legit-created-09",
+                type: "Medical",
+                place: "Downtown",
+                description: "Created by dual-verified citizen",
+                status: "Waiting for connection",
+                priority: "Critical",
+                createdBy: uid,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+            }));
+        });
+    });
+
+    // ===============================================================
+    // SEC-MIR-01: Email Verification Mirror Synchronization Tests
+    // Validates isValidUserEmailVerificationUpdate rule behavior.
+    // ===============================================================
+    describe("SEC-MIR-01: Email verification mirror synchronization", () => {
+
+        // Helper to seed a base unverified-mirror user document bypassing rules.
+        async function seedUnverifiedMirrorUser(uid, email, overrides = {}) {
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                await setDoc(doc(context.firestore(), "users", uid), {
+                    uid,
+                    displayName: "Test User",
+                    email,
+                    role: "CITIZEN",
+                    capabilities: ["CITIZEN"],
+                    citizenEnrollmentStatus: "ACTIVE",
+                    responderApplicationStatus: "NOT_APPLIED",
+                    registrationPath: "CITIZEN",
+                    approvalStatus: "NOT_REQUIRED",
+                    phoneVerified: false,
+                    emailVerified: false,   // mirror NOT yet synchronized
+                    accountStatus: "ACTIVE",
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                    ...overrides,
+                });
+            });
+        }
+
+        it("MIR-01: verified token, mirror false → true with server timestamps — ALLOW", async () => {
+            const uid = "mir-01-allow";
+            await seedUnverifiedMirrorUser(uid, "mir01@example.com");
+
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "mir01@example.com",
+                email_verified: true,   // Firebase token is verified
+            });
+            const db = ctx.firestore();
+
+            // The rule requires emailVerifiedAt == request.time and updatedAt == request.time.
+            // In the emulator, serverTimestamp() resolves to request.time.
+            await assertSucceeds(updateDoc(doc(db, "users", uid), {
+                emailVerified: true,
+                emailVerifiedAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+            }));
+        });
+
+        it("MIR-02: unverified token attempting mirror update — DENY", async () => {
+            const uid = "mir-02-deny-unverified";
+            await seedUnverifiedMirrorUser(uid, "mir02@example.com");
+
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "mir02@example.com",
+                email_verified: false,  // Token NOT verified
+            });
+            const db = ctx.firestore();
+
+            await assertFails(updateDoc(doc(db, "users", uid), {
+                emailVerified: true,
+                emailVerifiedAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+            }));
+        });
+
+        it("MIR-03: mirror true → false reversal — DENY (monotonic enforcement)", async () => {
+            const uid = "mir-03-deny-reversal";
+            await seedUnverifiedMirrorUser(uid, "mir03@example.com", {
+                emailVerified: true, // already true
+            });
+
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "mir03@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+
+            // Attempting to set emailVerified back to false must be denied.
+            await assertFails(updateDoc(doc(db, "users", uid), {
+                emailVerified: false,
+                emailVerifiedAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+            }));
+        });
+
+        it("MIR-04: verification update with arbitrary client-supplied emailVerifiedAt timestamp — DENY", async () => {
+            const uid = "mir-04-deny-arbitrary-ts";
+            await seedUnverifiedMirrorUser(uid, "mir04@example.com");
+
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "mir04@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+
+            // Client-supplied Date object instead of serverTimestamp() must be denied.
+            await assertFails(updateDoc(doc(db, "users", uid), {
+                emailVerified: true,
+                emailVerifiedAt: new Date("2020-01-01T00:00:00Z"), // backdated
+                updatedAt: new Date(),
+            }));
+        });
+
+        it("MIR-05: verification + role escalation in same update — DENY", async () => {
+            const uid = "mir-05-deny-role-escalation";
+            await seedUnverifiedMirrorUser(uid, "mir05@example.com");
+
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "mir05@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+
+            // diff includes 'role' which is NOT in the allowed set.
+            await assertFails(updateDoc(doc(db, "users", uid), {
+                emailVerified: true,
+                emailVerifiedAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+                role: "COMMAND",
+            }));
+        });
+
+        it("MIR-06: verification + capability escalation in same update — DENY", async () => {
+            const uid = "mir-06-deny-cap-escalation";
+            await seedUnverifiedMirrorUser(uid, "mir06@example.com");
+
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "mir06@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+
+            // diff includes 'capabilities' which is NOT in the allowed set.
+            await assertFails(updateDoc(doc(db, "users", uid), {
+                emailVerified: true,
+                emailVerifiedAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+                capabilities: ["CITIZEN", "RESPONDER"],
+            }));
+        });
+
+        it("MIR-07: verification + accountStatus manipulation in same update — DENY", async () => {
+            const uid = "mir-07-deny-status-manip";
+            await seedUnverifiedMirrorUser(uid, "mir07@example.com");
+
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "mir07@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+
+            await assertFails(updateDoc(doc(db, "users", uid), {
+                emailVerified: true,
+                emailVerifiedAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+                accountStatus: "SUSPENDED",
+            }));
+        });
+
+        it("MIR-08: missing user profile — DENY (rule requires userExists)", async () => {
+            const uid = "mir-08-deny-no-profile";
+            // Do NOT seed any document for this UID.
+
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "mir08@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+
+            // Update on a non-existent document is treated as a create by updateDoc
+            // and will fail because create requires isValidUserCreate, not the mirror rule.
+            await assertFails(updateDoc(doc(db, "users", uid), {
+                emailVerified: true,
+                emailVerifiedAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+            }));
+        });
+
+        it("MIR-09: suspended account — mirror update DENY (suspended accounts cannot self-verify)", async () => {
+            const uid = "mir-09-deny-suspended";
+            await seedUnverifiedMirrorUser(uid, "mir09@example.com", {
+                accountStatus: "SUSPENDED",
+            });
+
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "mir09@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+
+            await assertFails(updateDoc(doc(db, "users", uid), {
+                emailVerified: true,
+                emailVerifiedAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+            }));
+        });
+
+        it("MIR-10: normal valid Citizen self-update (non-verification fields) still works — ALLOW", async () => {
+            const uid = "mir-10-citizen-self-update";
+            await seedUnverifiedMirrorUser(uid, "mir10@example.com", {
+                emailVerified: true, // already verified — testing self-update path is unbroken
+            });
+
+            const ctx = testEnv.authenticatedContext(uid, {
+                email: "mir10@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+
+            await assertSucceeds(updateDoc(doc(db, "users", uid), {
+                displayName: "Updated Name",
+                updatedAt: serverTimestamp(),
+            }));
+        });
+
+        it("MIR-11: different user attempting to update another user's verification mirror — DENY", async () => {
+            const targetUid = "mir-11-target";
+            const attackerUid = "mir-11-attacker";
+            await seedUnverifiedMirrorUser(targetUid, "mir11target@example.com");
+            await seedUnverifiedMirrorUser(attackerUid, "mir11attacker@example.com", {
+                emailVerified: true,
+            });
+
+            const ctx = testEnv.authenticatedContext(attackerUid, {
+                email: "mir11attacker@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+
+            // Attacker tries to update a different user's document.
+            await assertFails(updateDoc(doc(db, "users", targetUid), {
+                emailVerified: true,
+                emailVerifiedAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+            }));
+        });
+
+        it("MIR-12: Coordinator/Admin privileges unchanged — verification rule does not alter command operations", async () => {
+            // Coordinator should still be able to perform their own self-update (displayName).
+            const coordinatorUid = "mir-12-coordinator";
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                await setDoc(doc(context.firestore(), "users", coordinatorUid), {
+                    uid: coordinatorUid,
+                    displayName: "Coordinator Smith",
+                    email: "coordinator.mir12@example.com",
+                    role: "COMMAND",
+                    commandLevel: "COORDINATOR",
+                    capabilities: [],
+                    citizenEnrollmentStatus: "INACTIVE",
+                    responderApplicationStatus: "NOT_APPLIED",
+                    registrationPath: "CITIZEN",
+                    approvalStatus: "NOT_REQUIRED",
+                    phoneVerified: false,
+                    emailVerified: true,
+                    accountStatus: "ACTIVE",
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+
+            const ctx = testEnv.authenticatedContext(coordinatorUid, {
+                email: "coordinator.mir12@example.com",
+                email_verified: true,
+            });
+            const db = ctx.firestore();
+
+            // Normal self-update (display name change) for Coordinator must still succeed.
+            await assertSucceeds(updateDoc(doc(db, "users", coordinatorUid), {
+                displayName: "Coordinator Smith (Updated)",
+                updatedAt: serverTimestamp(),
+            }));
+
+            // Coordinator cannot escalate their own commandLevel via the mirror rule.
+            await assertFails(updateDoc(doc(db, "users", coordinatorUid), {
+                emailVerified: true,
+                emailVerifiedAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+                commandLevel: "ADMINISTRATOR",
+            }));
         });
     });
 });

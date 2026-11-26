@@ -1,4 +1,4 @@
-import { collection, getDocs, getDoc, doc, query, limit, writeBatch, arrayUnion, serverTimestamp, } from "firebase/firestore";
+import { collection, getDocs, getDoc, doc, query, where, limit, writeBatch, arrayUnion, serverTimestamp, } from "firebase/firestore";
 import { auth, db, isFirebaseConfigured } from "../firebase";
 /**
  * Calculate genuine aggregate metrics directly from real incident records.
@@ -153,10 +153,60 @@ export async function completeIncidentAtomic(incidentId, responderId) {
     await batch.commit();
 }
 /**
+ * Fetch pending responder applications for Command review.
+ */
+export async function fetchPendingResponderApplications() {
+    if (!isFirebaseConfigured || !db) {
+        return [];
+    }
+    try {
+        const q = query(
+            collection(db, "users"),
+            where("responderApplicationStatus", "==", "PENDING"),
+            limit(50)
+        );
+        const snap = await getDocs(q);
+        const applications = [];
+        snap.forEach((d) => {
+            const data = d.data();
+            applications.push({
+                uid: data.uid,
+                displayName: data.displayName || "Applicant",
+                email: data.email || "",
+                phoneNumber: data.phoneNumber || "",
+                role: data.role || "CITIZEN",
+                requestedRole: data.requestedRole,
+                requestedResponderSubtype: data.requestedResponderSubtype || "VOLUNTEER",
+                responderApplicationStatus: data.responderApplicationStatus,
+                approvalStatus: data.approvalStatus,
+                citizenEnrollmentStatus: data.citizenEnrollmentStatus,
+                registrationPath: data.registrationPath,
+                region: data.region || "",
+                district: data.district || "",
+                city: data.city || "",
+                requestedUnit: data.requestedUnit || "GENERAL",
+                organization: data.organization || "",
+                designation: data.designation || "",
+                experienceYears: data.experienceYears != null ? data.experienceYears : 0,
+                credentialsSummary: data.credentialsSummary || "",
+                accountStatus: data.accountStatus,
+                emailVerified: Boolean(data.emailVerified),
+                createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : data.createdAt || null,
+                updatedAt: data.updatedAt?.toDate ? data.updatedAt.toDate().toISOString() : data.updatedAt || null,
+            });
+        });
+        return applications;
+    } catch (err) {
+        console.warn("[CommandService] Failed to fetch pending applications:", err);
+        return [];
+    }
+}
+/**
  * Approve a pending responder application granting dual capability (v2.1 Architecture).
  * Validates applicant standing and atomically grants ['CITIZEN', 'RESPONDER'].
+ * Atomically creates responder profile and an immutable review audit log record.
  */
-export async function approveResponderApplication(applicantUid, coordinatorUid, approvedSubtype) {
+export async function approveResponderApplication(applicantUid, coordinatorUid, options = {}) {
     if (!isFirebaseConfigured || !db) {
         throw new Error("Firebase is not configured");
     }
@@ -172,10 +222,26 @@ export async function approveResponderApplication(applicantUid, coordinatorUid, 
     if (applicant.accountStatus === "SUSPENDED") {
         throw new Error("Cannot approve responder application: Account is suspended.");
     }
-    const subtype = approvedSubtype || applicant.requestedResponderSubtype || "VOLUNTEER";
+    if (applicant.responderApplicationStatus !== "PENDING" || applicant.approvalStatus !== "PENDING") {
+        throw new Error("Cannot approve responder application: Application is not in PENDING status.");
+    }
+    const reviewerRole = typeof options === "object" && options?.reviewerRole ? options.reviewerRole : "COORDINATOR";
+    if (!["COORDINATOR", "ADMINISTRATOR"].includes(reviewerRole)) {
+        throw new Error("Authorization error: Only Command staff (COORDINATOR or ADMINISTRATOR) can approve responder applications.");
+    }
+    const reviewerName = typeof options === "object" && options?.reviewerName ? String(options.reviewerName).trim() : null;
+    const reviewerDesignation = typeof options === "object" && options?.reviewerDesignation
+        ? String(options.reviewerDesignation).trim()
+        : reviewerRole === "ADMINISTRATOR"
+            ? "Command Administrator"
+            : "Command Operations Coordinator";
+    const subtype = typeof options === "string" ? options : options?.approvedSubtype || applicant.requestedResponderSubtype || "VOLUNTEER";
+    const notes = typeof options === "object" && options?.notes ? options.notes : null;
     const now = serverTimestamp();
+    const reviewId = `rev_${applicantUid}_${Date.now()}`;
     const batch = writeBatch(db);
-    // Dual capability granted
+
+    // 1. Dual capability granted on user profile
     batch.update(userRef, {
         capabilities: ["CITIZEN", "RESPONDER"],
         citizenEnrollmentStatus: "ACTIVE",
@@ -186,16 +252,20 @@ export async function approveResponderApplication(applicantUid, coordinatorUid, 
         dutyStatus: "OFF_DUTY",
         activeIncidentId: null,
         reviewedBy: coordinatorUid,
+        approvedBy: coordinatorUid,
         reviewedAt: now,
+        approvedAt: now,
+        lastReviewId: reviewId,
         updatedAt: now,
     });
-    // Initialize or update responder profile
+
+    // 2. Initialize or update responder profile
     const profileRef = doc(db, "responderProfiles", applicantUid);
     batch.set(profileRef, {
         uid: applicantUid,
         displayName: applicant.displayName || "Approved Responder",
         email: applicant.email,
-        phoneNumber: applicant.phoneNumber,
+        phoneNumber: applicant.phoneNumber || null,
         responderSubtype: subtype,
         availabilityStatus: "UNAVAILABLE",
         dutyStatus: "OFF_DUTY",
@@ -203,15 +273,42 @@ export async function approveResponderApplication(applicantUid, coordinatorUid, 
         skills: ["First Aid", "Radio Mesh", "Field Search"],
         updatedAt: new Date().toISOString(),
     }, { merge: true });
+
+    // 3. Create immutable audit record
+    const reviewRef = doc(db, "responderApplicationReviews", reviewId);
+    batch.set(reviewRef, {
+        id: reviewId,
+        applicantUid,
+        applicantName: applicant.displayName || "Approved Responder",
+        applicantEmail: applicant.email || "",
+        decision: "APPROVED",
+        requestedSubtype: applicant.requestedResponderSubtype || "VOLUNTEER",
+        assignedSubtype: subtype,
+        reviewerUid: coordinatorUid,
+        reviewerName,
+        reviewerRole,
+        reviewerDesignation,
+        previousStatus: "PENDING",
+        newStatus: "APPROVED",
+        rejectionReason: null,
+        reviewerNotes: notes,
+        reviewedAt: now,
+    });
+
     await batch.commit();
+    return { reviewId, status: "APPROVED" };
 }
 /**
  * Reject a pending responder application with audited reason.
  * Preserves Citizen capabilities if applicant had completed citizen enrollment.
+ * Atomically writes the rejection decision and an immutable review audit log record.
  */
-export async function rejectResponderApplication(applicantUid, coordinatorUid, reason) {
+export async function rejectResponderApplication(applicantUid, coordinatorUid, reason, options = {}) {
     if (!isFirebaseConfigured || !db) {
         throw new Error("Firebase is not configured");
+    }
+    if (!reason || typeof reason !== "string" || !reason.trim()) {
+        throw new Error("Rejection reason is mandatory.");
     }
     const userRef = doc(db, "users", applicantUid);
     const snap = await getDoc(userRef);
@@ -219,19 +316,62 @@ export async function rejectResponderApplication(applicantUid, coordinatorUid, r
         throw new Error(`User ${applicantUid} not found`);
     }
     const applicant = snap.data();
+    if (applicant.responderApplicationStatus !== "PENDING" || applicant.approvalStatus !== "PENDING") {
+        throw new Error("Cannot reject responder application: Application is not in PENDING status.");
+    }
+    const reviewerRole = typeof options === "object" && options?.reviewerRole ? options.reviewerRole : "COORDINATOR";
+    if (!["COORDINATOR", "ADMINISTRATOR"].includes(reviewerRole)) {
+        throw new Error("Authorization error: Only Command staff (COORDINATOR or ADMINISTRATOR) can reject responder applications.");
+    }
+    const reviewerName = typeof options === "object" && options?.reviewerName ? String(options.reviewerName).trim() : null;
+    const reviewerDesignation = typeof options === "object" && options?.reviewerDesignation
+        ? String(options.reviewerDesignation).trim()
+        : reviewerRole === "ADMINISTRATOR"
+            ? "Command Administrator"
+            : "Command Operations Coordinator";
+    const notes = typeof options === "object" && options?.notes ? options.notes : null;
     const now = serverTimestamp();
+    const reviewId = `rev_${applicantUid}_${Date.now()}`;
     // If applicant had active citizen status, preserve citizen capability
     const hadCitizen = applicant.citizenEnrollmentStatus === "ACTIVE";
     const nextCapabilities = hadCitizen ? ["CITIZEN"] : [];
-    await updateDoc(userRef, {
+    const batch = writeBatch(db);
+
+    // 1. Rejection state transition on user profile
+    batch.update(userRef, {
         capabilities: nextCapabilities,
         approvalStatus: "REJECTED",
         responderApplicationStatus: "REJECTED",
         role: "CITIZEN",
         responderSubtype: null,
-        rejectionReason: reason || "Application requirements not met",
+        rejectionReason: reason.trim(),
         reviewedBy: coordinatorUid,
         reviewedAt: now,
+        lastReviewId: reviewId,
         updatedAt: now,
     });
+
+    // 2. Create immutable audit record
+    const reviewRef = doc(db, "responderApplicationReviews", reviewId);
+    batch.set(reviewRef, {
+        id: reviewId,
+        applicantUid,
+        applicantName: applicant.displayName || "Applicant",
+        applicantEmail: applicant.email || "",
+        decision: "REJECTED",
+        requestedSubtype: applicant.requestedResponderSubtype || "VOLUNTEER",
+        assignedSubtype: null,
+        reviewerUid: coordinatorUid,
+        reviewerName,
+        reviewerRole,
+        reviewerDesignation,
+        previousStatus: "PENDING",
+        newStatus: "REJECTED",
+        rejectionReason: reason.trim(),
+        reviewerNotes: notes,
+        reviewedAt: now,
+    });
+
+    await batch.commit();
+    return { reviewId, status: "REJECTED" };
 }
