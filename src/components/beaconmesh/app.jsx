@@ -18,7 +18,7 @@ import { WORKSPACE_ROUTES } from "@/lib/auth-types";
 import { createEmergencyReport, getUserIncidents, getAllIncidents, updateIncidentStatus, subscribeToIncidents, appendIncidentTimelineEvent, subscribeToIncidentTimeline, } from "@/lib/services/incident-service";
 import { createAndVerifySafeZone, subscribeToSafeZones, } from "@/lib/services/safezone-service";
 import { getResponderProfile, setResponderAvailability, } from "@/lib/services/responder-service";
-import { computeIncidentAggregates, getOperationalUserDirectory, fetchPendingResponderApplications, approveResponderApplication, rejectResponderApplication, fetchRecentApplicationReviews, createPersonnelInvitation, fetchPersonnelInvitations, revokePersonnelInvitation, suspendUserAccount, reactivateUserAccount, fetchAccountAuditHistory, fetchReviewById, assignIncidentAtomic, completeIncidentAtomic, respondToAssignmentOffer, updateResponderFieldProgress, verifyAndCloseIncident, subscribeToResponderAssignments, subscribeToIncidentAssignments, RESPONDER_FIELD_SEQUENCE, } from "@/lib/services/command-service";
+import { computeIncidentAggregates, getOperationalUserDirectory, fetchPendingResponderApplications, approveResponderApplication, rejectResponderApplication, fetchRecentApplicationReviews, createPersonnelInvitation, sendPersonnelInvitationEmail, buildInvitationUrl, fetchPersonnelInvitations, revokePersonnelInvitation, suspendUserAccount, reactivateUserAccount, fetchAccountAuditHistory, fetchReviewById, assignIncidentAtomic, completeIncidentAtomic, respondToAssignmentOffer, updateResponderFieldProgress, verifyAndCloseIncident, subscribeToResponderAssignments, subscribeToIncidentAssignments, RESPONDER_FIELD_SEQUENCE, } from "@/lib/services/command-service";
 import { initAutoSync, flushOutbox } from "@/lib/services/sync-service";
 import { NotificationCenter } from "./notification-center";
 import { subscribeToUserNotifications, markNotificationAsRead, markAllNotificationsAsRead } from "@/lib/services/notification-service";
@@ -579,6 +579,8 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
   const [provSubmitting, setProvSubmitting] = useState(false);
   const [provResult, setProvResult] = useState(null);
   const [provCopied, setProvCopied] = useState(false);
+  const [provEmailState, setProvEmailState] = useState(null);
+  const [resendingInviteId, setResendingInviteId] = useState(null);
   const [managedUser, setManagedUser] = useState(null);
   const [manageAuditLogs, setManageAuditLogs] = useState([]);
   const [manageApprovalRecord, setManageApprovalRecord] = useState(null);
@@ -2201,6 +2203,7 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
                 e.preventDefault();
                 setReviewFeedback(null);
                 setProvResult(null);
+                setProvEmailState(null);
                 setProvCopied(false);
                 setProvSubmitting(true);
                 try {
@@ -2217,11 +2220,26 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
                   setProvName("");
                   setProvEmail("");
                   setProvUnit("GENERAL");
+                  setProvEmailState({ status: "sending" });
                   setReviewFeedback({
                     type: "success",
-                    text: `Provisioning invitation created for ${res.fullName}.`,
+                    text: `Invitation created for ${res.fullName}. Sending invitation email...`,
                   });
                   await refreshUsersAndApplications();
+                  const emailRes = await sendPersonnelInvitationEmail({ invitationId: res.id });
+                  if (emailRes.ok) {
+                    setProvEmailState({ status: "sent", messageId: emailRes.messageId });
+                    setReviewFeedback({
+                      type: "success",
+                      text: `Invitation created and email accepted for delivery to ${res.email}.`,
+                    });
+                  } else {
+                    setProvEmailState({ status: "failed", error: emailRes.error });
+                    setReviewFeedback({
+                      type: "error",
+                      text: `Invitation created, but email failed: ${emailRes.error}`,
+                    });
+                  }
                 } catch (err) {
                   setReviewFeedback({
                     type: "error",
@@ -2294,8 +2312,49 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
             </form>
 
             {provResult && (
-              <div className="rounded-md border border-safe/30 bg-safe/10 p-4 space-y-2 text-xs">
-                <p className="font-semibold text-safe">Invitation Ready (Expires in 7 days)</p>
+              <div className="rounded-md border border-safe/30 bg-safe/10 p-4 space-y-2.5 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="font-semibold text-safe">Invitation Ready (Expires in 7 days)</p>
+                  {provEmailState?.status === "sending" && (
+                    <Pill tone="signal">Sending invitation…</Pill>
+                  )}
+                  {provEmailState?.status === "sent" && (
+                    <Pill tone="good">
+                      Accepted by provider (Resend){provEmailState.messageId ? ` · ${provEmailState.messageId}` : ""}
+                    </Pill>
+                  )}
+                  {provEmailState?.status === "failed" && (
+                    <Pill tone="warn">Email failed</Pill>
+                  )}
+                </div>
+                {provEmailState?.status === "failed" && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-urgent/30 bg-urgent/10 p-2.5 text-urgent">
+                    <span>{provEmailState.error}</span>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={async () => {
+                        setProvEmailState({ status: "sending" });
+                        const retryRes = await sendPersonnelInvitationEmail({
+                          invitationId: provResult.id,
+                          isRetry: true,
+                        });
+                        if (retryRes.ok) {
+                          setProvEmailState({ status: "sent", messageId: retryRes.messageId });
+                          setReviewFeedback({
+                            type: "success",
+                            text: `Invitation email accepted for delivery to ${provResult.email}.`,
+                          });
+                        } else {
+                          setProvEmailState({ status: "failed", error: retryRes.error });
+                        }
+                      }}
+                    >
+                      Retry Send Email
+                    </Button>
+                  </div>
+                )}
                 <div className="flex flex-wrap items-center gap-2">
                   <code className="flex-1 break-all rounded bg-background px-2.5 py-1.5 font-mono text-[0.7rem] border border-border">
                     {provResult.inviteUrl}
@@ -2324,7 +2383,10 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
                 Provisioning Invitations ({invitations.length})
               </h4>
               <div className="space-y-2">
-                {invitations.map((inv) => (
+                {invitations.map((inv) => {
+                  const isExpired = inv.status === "PENDING" && inv.expiresAtIso && new Date(inv.expiresAtIso).getTime() <= Date.now();
+                  const displayStatus = isExpired ? "EXPIRED" : inv.status;
+                  return (
                   <div
                     key={inv.id}
                     className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-card p-3.5 text-xs"
@@ -2332,35 +2394,82 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
                     <div className="space-y-0.5">
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="font-semibold text-foreground">{inv.fullName}</span>
-                        <Pill tone={inv.status === "PENDING" ? "warn" : inv.status === "CLAIMED" ? "good" : "neutral"}>
-                          {inv.status}
+                        <Pill tone={displayStatus === "PENDING" ? "warn" : displayStatus === "CLAIMED" ? "good" : "neutral"}>
+                          {displayStatus}
                         </Pill>
                         <Pill tone="neutral">{inv.targetCommandLevel || inv.targetResponderSubtype || inv.targetRole}</Pill>
                       </div>
                       <p className="text-muted-foreground">
-                        {inv.email} · {inv.designation} · Invited by {inv.invitedByName}
+                        {inv.email} · {inv.targetUnit || inv.targetCommandLevel || "Personnel"} · Invited by {inv.invitedByName}
                       </p>
                     </div>
-                    {inv.status === "PENDING" && (
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        onClick={async () => {
-                          try {
-                            await revokePersonnelInvitation(inv.id);
-                            setReviewFeedback({ type: "success", text: `Revoked invitation for ${inv.email}.` });
-                            await refreshUsersAndApplications();
-                          } catch (err) {
-                            setReviewFeedback({ type: "error", text: err?.message || "Failed to revoke invitation." });
-                          }
-                        }}
-                      >
-                        Revoke
-                      </Button>
+                    {inv.status === "PENDING" && !isExpired && (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={resendingInviteId === inv.id}
+                          onClick={async () => {
+                            setResendingInviteId(inv.id);
+                            try {
+                              const resendRes = await sendPersonnelInvitationEmail({
+                                invitationId: inv.id,
+                                isResend: true,
+                              });
+                              if (resendRes.ok) {
+                                setReviewFeedback({
+                                  type: "success",
+                                  text: `Invitation email accepted for delivery to ${inv.email}.`,
+                                });
+                              } else {
+                                setReviewFeedback({
+                                  type: "error",
+                                  text: `Resend failed for ${inv.email}: ${resendRes.error}`,
+                                });
+                              }
+                            } finally {
+                              setResendingInviteId(null);
+                            }
+                          }}
+                        >
+                          {resendingInviteId === inv.id ? "Sending..." : "Resend Email"}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => {
+                            const url = buildInvitationUrl(inv.id, inv.email);
+                            if (navigator.clipboard) {
+                              void navigator.clipboard.writeText(url);
+                              setReviewFeedback({ type: "success", text: `Copied invite link for ${inv.email}.` });
+                            }
+                          }}
+                        >
+                          Copy Link
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={async () => {
+                            try {
+                              await revokePersonnelInvitation(inv.id);
+                              setReviewFeedback({ type: "success", text: `Revoked invitation for ${inv.email}.` });
+                              await refreshUsersAndApplications();
+                            } catch (err) {
+                              setReviewFeedback({ type: "error", text: err?.message || "Failed to revoke invitation." });
+                            }
+                          }}
+                        >
+                          Revoke
+                        </Button>
+                      </div>
                     )}
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}

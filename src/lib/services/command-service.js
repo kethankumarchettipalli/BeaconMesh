@@ -1173,6 +1173,95 @@ export const VALID_OPERATIONAL_UNITS = [
  * Strictly blocks creating another ADMINISTRATOR.
  * Administrator sets only identity + trusted role/classification/unit (no personal persona details).
  */
+export const DEFAULT_PRODUCTION_APP_URL = "https://beacon-mesh-eta.vercel.app";
+
+/**
+ * Resolve the base URL for personnel invitation links.
+ * Defaults to the production Vercel deployment and never leaks localhost into production invitations.
+ */
+export function resolveInvitationBaseUrl(options = {}) {
+    const envUrl = (import.meta?.env?.VITE_PUBLIC_APP_URL || "").trim();
+    if (envUrl) {
+        try {
+            const parsed = new URL(envUrl);
+            if (!import.meta?.env?.PROD || (parsed.hostname !== "localhost" && parsed.hostname !== "127.0.0.1")) {
+                return parsed.origin;
+            }
+        }
+        catch {
+            // fall through to safe default
+        }
+    }
+    if (
+        options.preferLocalOrigin &&
+        !import.meta?.env?.PROD &&
+        typeof window !== "undefined" &&
+        window.location?.origin &&
+        (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
+    ) {
+        return window.location.origin;
+    }
+    return DEFAULT_PRODUCTION_APP_URL;
+}
+
+/**
+ * Build an encoded single-use personnel invitation registration URL.
+ */
+export function buildInvitationUrl(invitationId, email, options = {}) {
+    const baseUrl = resolveInvitationBaseUrl(options);
+    const normalizedEmail = String(email || "").trim().toLowerCase();
+    return `${baseUrl}/signup?invite=${encodeURIComponent(invitationId)}&email=${encodeURIComponent(normalizedEmail)}`;
+}
+
+/**
+ * Request the server-side email endpoint to send (or resend) an invitation email via Resend.
+ */
+export async function sendPersonnelInvitationEmail({ invitationId, isRetry = false, isResend = false }) {
+    if (!invitationId) {
+        return { ok: false, status: "FAILED", error: "Invitation ID is required." };
+    }
+    if (!auth?.currentUser) {
+        return { ok: false, status: "FAILED", error: "Administrator authentication required." };
+    }
+    try {
+        const idToken = await auth.currentUser.getIdToken();
+        const res = await fetch("/api/send-invitation-email", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${idToken}`,
+            },
+            body: JSON.stringify({
+                invitationId,
+                isRetry,
+                isResend,
+            }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            return {
+                ok: false,
+                status: "FAILED",
+                error: data?.error || `Email service returned HTTP ${res.status}.`,
+            };
+        }
+        return {
+            ok: true,
+            status: "SENT",
+            provider: data?.provider || "resend",
+            messageId: data?.messageId || null,
+            inviteUrl: data?.inviteUrl || null,
+        };
+    }
+    catch (err) {
+        return {
+            ok: false,
+            status: "FAILED",
+            error: err?.message || "Network error while contacting email service.",
+        };
+    }
+}
+
 export async function createPersonnelInvitation(params) {
     const admin = await assertActiveAdministrator();
     const fullName = String(params?.fullName || "").trim();
@@ -1227,8 +1316,7 @@ export async function createPersonnelInvitation(params) {
     const invitationId = cryptoApi.randomUUID();
     const auditId = `aud_prov_${invitationId}`;
     const expiresAtDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    const origin = typeof window !== "undefined" ? window.location.origin : "https://beaconmesh.org";
-    const inviteUrl = `${origin}/signup?invite=${encodeURIComponent(invitationId)}&email=${encodeURIComponent(normalizedEmail)}`;
+    const inviteUrl = buildInvitationUrl(invitationId, normalizedEmail);
 
     const record = {
         id: invitationId,

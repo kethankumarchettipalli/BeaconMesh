@@ -2,6 +2,7 @@ import "./lib/error-capture";
 
 import { consumeLastCapturedError } from "./lib/error-capture";
 import { renderErrorPage } from "./lib/error-page";
+import { handleSendInvitationEmail } from "./lib/email/send-invitation-handler.js";
 
 let serverEntryPromise;
 
@@ -46,6 +47,20 @@ function isH3SwallowedErrorBody(body) {
 export default {
   async fetch(request, env, ctx) {
     try {
+      const url = new URL(request.url);
+      if (url.pathname === "/api/send-invitation-email") {
+        const bodyText = request.method === "POST" ? await request.text() : "";
+        const result = await handleSendInvitationEmail({
+          method: request.method,
+          authorizationHeader: request.headers.get("authorization") || "",
+          body: bodyText,
+          env,
+        });
+        return new Response(JSON.stringify(result.body), {
+          status: result.status,
+          headers: { "content-type": "application/json; charset=utf-8" },
+        });
+      }
       const handler = await getServerEntry();
       const response = await handler.fetch(request, env, ctx);
       return await normalizeCatastrophicSsrResponse(response);
