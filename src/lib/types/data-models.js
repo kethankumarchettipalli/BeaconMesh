@@ -31,7 +31,8 @@ export function validateIncidentPayload(data) {
     // Location validation
     if (data.location) {
         const { latitude, longitude, source } = data.location;
-        if (source !== "UNAVAILABLE") {
+        const hasCoords = latitude !== null && latitude !== undefined && longitude !== null && longitude !== undefined;
+        if (source === "GPS" || (source !== "UNAVAILABLE" && source !== "MANUAL") || hasCoords) {
             if (typeof latitude !== "number" || isNaN(latitude) || latitude < -90 || latitude > 90) {
                 errors.push("Invalid latitude: must be between -90 and 90.");
             }

@@ -72,7 +72,9 @@ export async function getResponderProfile(userOrUid) {
     };
 }
 /**
- * Update responder availability (e.g. AVAILABLE vs UNAVAILABLE)
+ * Update responder availability (e.g. AVAILABLE vs UNAVAILABLE vs OFF_DUTY).
+ * Persists `users/{uid}.dutyStatus` to Firestore first when online (authoritative source of truth),
+ * then updates local Dexie `responderProfiles` and `responderProfiles/{uid}` only after success.
  */
 export async function setResponderAvailability(uid, availability, operationalStatus) {
     const availabilityStatus = typeof availability === "boolean"
@@ -80,6 +82,9 @@ export async function setResponderAvailability(uid, availability, operationalSta
             ? "AVAILABLE"
             : "UNAVAILABLE"
         : availability;
+    if (!["AVAILABLE", "UNAVAILABLE", "OFF_DUTY"].includes(availabilityStatus)) {
+        throw new Error(`Invalid availability status "${availabilityStatus}".`);
+    }
     const now = new Date().toISOString();
     const updates = {
         availabilityStatus,
@@ -87,16 +92,40 @@ export async function setResponderAvailability(uid, availability, operationalSta
     };
     if (operationalStatus)
         updates.operationalStatus = operationalStatus;
+
+    const isOnline = typeof navigator !== "undefined" && navigator.onLine;
+    if (isFirebaseConfigured && db && isOnline && auth?.currentUser) {
+        await updateDoc(doc(db, "users", uid), {
+            dutyStatus: availabilityStatus,
+            updatedAt: serverTimestamp(),
+        });
+        await setDoc(doc(db, "responderProfiles", uid), {
+            uid,
+            availabilityStatus,
+            ...(operationalStatus ? { operationalStatus } : {}),
+            updatedAt: serverTimestamp(),
+        }, { merge: true });
+    }
+    else {
+        await enqueueOutboxItem("UPDATE_RESPONDER_AVAILABILITY", "responderProfiles", uid, updates);
+    }
+
     const localDb = getLocalDb();
     if (localDb) {
         try {
-            await localDb.responderProfiles.update(uid, updates);
+            const existing = await localDb.responderProfiles.get(uid);
+            if (existing) {
+                await localDb.responderProfiles.update(uid, updates);
+            }
+            else {
+                await localDb.responderProfiles.put({ uid, ...updates });
+            }
         }
         catch {
-            // ignore
+            // ignore local cache error after authoritative write
         }
     }
-    await enqueueOutboxItem("UPDATE_RESPONDER_AVAILABILITY", "responderProfiles", uid, updates);
+    return availabilityStatus;
 }
 /**
  * Get assigned incidents for a given responder UID

@@ -1960,6 +1960,7 @@ describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
 
         it("ACCT-2: Suspended token claim + Active profile -> Follows Canonical Profile (ALLOWED)", async () => {
             const uid = "user-active-profile-stale-token";
+            const ownIncidentId = "BM-ACCT2-OWN";
             await testEnv.withSecurityRulesDisabled(async (context) => {
                 const fdb = context.firestore();
                 await setDoc(doc(fdb, "users", uid), {
@@ -1976,6 +1977,16 @@ describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
                     createdAt: new Date(),
                     updatedAt: new Date(),
                 });
+                await setDoc(doc(fdb, "incidents", ownIncidentId), {
+                    id: ownIncidentId,
+                    type: "Medical",
+                    place: "Vijayawada",
+                    status: "Waiting for connection",
+                    priority: "High",
+                    createdBy: uid,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                });
             });
             const ctx = testEnv.authenticatedContext(uid, {
                 email: "active@example.com",
@@ -1983,7 +1994,8 @@ describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
                 accountStatus: "SUSPENDED", // Token claim says SUSPENDED
             });
             const db = ctx.firestore();
-            await assertSucceeds(getDoc(doc(db, "incidents", incidentId)));
+            await assertSucceeds(getDoc(doc(db, "incidents", ownIncidentId)));
+            await assertFails(getDoc(doc(db, "incidents", incidentId)));
         });
 
         it("ACCT-3: Active verified user with missing accountStatus in profile -> DENIED (fails closed)", async () => {
@@ -4367,6 +4379,624 @@ describe("Real Firestore Emulator Security Rules & Attack Vector Audit", () => {
                 updatedAt: serverTimestamp(),
                 commandLevel: "ADMINISTRATOR",
             }));
+        });
+    });
+
+    describe("Command Personnel Provisioning, Directory Scoping & Audit Trail", () => {
+        const adminUid = "prov-admin-01";
+        const coordUid = "prov-coord-01";
+        const coord2Uid = "prov-coord-02";
+        const citizenUid = "prov-cit-01";
+        const responderUid = "prov-resp-01";
+        const pendingUid = "prov-pend-01";
+
+        beforeEach(async () => {
+            const now = new Date();
+            await testEnv.withSecurityRulesDisabled(async (ctx) => {
+                const db = ctx.firestore();
+                await setDoc(doc(db, "users", adminUid), {
+                    uid: adminUid, displayName: "Kethan Admin", email: "admin.prov@beaconmesh.org",
+                    role: "COMMAND", commandLevel: "ADMINISTRATOR", capabilities: [],
+                    approvalStatus: "NOT_REQUIRED", accountStatus: "ACTIVE", emailVerified: true, phoneVerified: false,
+                    createdAt: now, updatedAt: now,
+                });
+                await setDoc(doc(db, "users", coordUid), {
+                    uid: coordUid, displayName: "Ops Coordinator 1", email: "coord1.prov@beaconmesh.org",
+                    role: "COMMAND", commandLevel: "COORDINATOR", capabilities: [],
+                    approvalStatus: "NOT_REQUIRED", accountStatus: "ACTIVE", emailVerified: true, phoneVerified: false,
+                    createdAt: now, updatedAt: now,
+                });
+                await setDoc(doc(db, "users", coord2Uid), {
+                    uid: coord2Uid, displayName: "Ops Coordinator 2", email: "coord2.prov@beaconmesh.org",
+                    role: "COMMAND", commandLevel: "COORDINATOR", capabilities: [],
+                    approvalStatus: "NOT_REQUIRED", accountStatus: "ACTIVE", emailVerified: true, phoneVerified: false,
+                    createdAt: now, updatedAt: now,
+                });
+                await setDoc(doc(db, "users", citizenUid), {
+                    uid: citizenUid, displayName: "Citizen One", email: "cit.prov@example.com",
+                    role: "CITIZEN", capabilities: ["CITIZEN"], citizenEnrollmentStatus: "ACTIVE",
+                    approvalStatus: "NOT_REQUIRED", accountStatus: "ACTIVE", emailVerified: true, phoneVerified: false,
+                    createdAt: now, updatedAt: now,
+                });
+                await setDoc(doc(db, "users", responderUid), {
+                    uid: responderUid, displayName: "Responder One", email: "resp.prov@example.com",
+                    role: "RESPONDER", responderSubtype: "PROFESSIONAL", capabilities: ["CITIZEN", "RESPONDER"],
+                    approvalStatus: "APPROVED", accountStatus: "ACTIVE", emailVerified: true, phoneVerified: false,
+                    createdAt: now, updatedAt: now,
+                });
+                await setDoc(doc(db, "users", pendingUid), {
+                    uid: pendingUid, displayName: "Pending Applicant", email: "pend.prov@example.com",
+                    role: "CITIZEN", capabilities: [], citizenEnrollmentStatus: "INACTIVE",
+                    responderApplicationStatus: "PENDING", requestedRole: "RESPONDER", requestedResponderSubtype: "VOLUNTEER",
+                    approvalStatus: "PENDING", accountStatus: "ACTIVE", emailVerified: true, phoneVerified: false,
+                    createdAt: now, updatedAt: now,
+                });
+            });
+        });
+
+        it("PROV-01: Coordinator can read Responders and Pending Applicants, but DENIED Citizens, Admins, and other Coordinators", async () => {
+            const coordDb = testEnv.authenticatedContext(coordUid, { email: "coord1.prov@beaconmesh.org", email_verified: true }).firestore();
+            await assertSucceeds(getDoc(doc(coordDb, "users", responderUid)));
+            await assertSucceeds(getDoc(doc(coordDb, "users", pendingUid)));
+            await assertSucceeds(getDoc(doc(coordDb, "users", coordUid)));
+            await assertFails(getDoc(doc(coordDb, "users", citizenUid)));
+            await assertFails(getDoc(doc(coordDb, "users", adminUid)));
+            await assertFails(getDoc(doc(coordDb, "users", coord2Uid)));
+        });
+
+        it("PROV-02: Administrator can read all directory categories", async () => {
+            const adminDb = testEnv.authenticatedContext(adminUid, { email: "admin.prov@beaconmesh.org", email_verified: true }).firestore();
+            await assertSucceeds(getDoc(doc(adminDb, "users", citizenUid)));
+            await assertSucceeds(getDoc(doc(adminDb, "users", responderUid)));
+            await assertSucceeds(getDoc(doc(adminDb, "users", coordUid)));
+            await assertSucceeds(getDoc(doc(adminDb, "users", adminUid)));
+        });
+
+        it("PROV-03: Administrator can create COORDINATOR and RESPONDER invitations, but CANNOT create ADMINISTRATOR invitation", async () => {
+            const adminDb = testEnv.authenticatedContext(adminUid, { email: "admin.prov@beaconmesh.org", email_verified: true }).firestore();
+            const future = new Date(Date.now() + 86400000);
+            await assertSucceeds(setDoc(doc(adminDb, "invitations", "inv-coord-1"), {
+                id: "inv-coord-1", email: "newcoord@example.com", fullName: "New Coord",
+                targetRole: "COMMAND", targetCommandLevel: "COORDINATOR", targetResponderSubtype: null, targetUnit: null,
+                status: "PENDING", invitedByUid: adminUid, invitedByName: "Kethan Admin",
+                invitedByCommandLevel: "ADMINISTRATOR", createdAt: serverTimestamp(), expiresAt: future,
+            }));
+            await assertSucceeds(setDoc(doc(adminDb, "invitations", "inv-resp-1"), {
+                id: "inv-resp-1", email: "newresp@example.com", fullName: "New Resp",
+                targetRole: "RESPONDER", targetCommandLevel: null, targetResponderSubtype: "PROFESSIONAL", targetUnit: "MEDICAL",
+                status: "PENDING", invitedByUid: adminUid, invitedByName: "Kethan Admin",
+                invitedByCommandLevel: "ADMINISTRATOR", createdAt: serverTimestamp(), expiresAt: future,
+            }));
+            await assertFails(setDoc(doc(adminDb, "invitations", "inv-bad-admin"), {
+                id: "inv-bad-admin", email: "badadmin@example.com", fullName: "Bad Admin",
+                targetRole: "COMMAND", targetCommandLevel: "ADMINISTRATOR", targetResponderSubtype: null, targetUnit: null,
+                status: "PENDING", invitedByUid: adminUid, invitedByName: "Kethan Admin",
+                invitedByCommandLevel: "ADMINISTRATOR", createdAt: serverTimestamp(), expiresAt: future,
+            }));
+        });
+
+        it("PROV-04: Coordinator CANNOT create or list invitations", async () => {
+            const coordDb = testEnv.authenticatedContext(coordUid, { email: "coord1.prov@beaconmesh.org", email_verified: true }).firestore();
+            await assertFails(setDoc(doc(coordDb, "invitations", "inv-coord-forged"), {
+                id: "inv-coord-forged", email: "forged@example.com", fullName: "Forged",
+                targetRole: "COMMAND", targetCommandLevel: "COORDINATOR", targetResponderSubtype: null,
+                status: "PENDING", invitedByUid: coordUid, invitedByName: "Ops Coordinator 1",
+                invitedByCommandLevel: "ADMINISTRATOR", createdAt: serverTimestamp(), expiresAt: new Date(Date.now() + 86400000),
+            }));
+        });
+
+        it("PROV-05: Canonical audit trail (reviewerRole COMMAND + reviewerCommandLevel) enforced and immutable", async () => {
+            const adminDb = testEnv.authenticatedContext(adminUid, { email: "admin.prov@beaconmesh.org", email_verified: true }).firestore();
+            const reviewId = "rev-canon-01";
+            const batch = writeBatch(adminDb);
+            batch.update(doc(adminDb, "users", pendingUid), {
+                role: "RESPONDER", responderSubtype: "VOLUNTEER", approvalStatus: "APPROVED",
+                responderApplicationStatus: "APPROVED", capabilities: ["CITIZEN", "RESPONDER"],
+                citizenEnrollmentStatus: "ACTIVE", dutyStatus: "OFF_DUTY", activeIncidentId: null,
+                reviewedBy: adminUid, approvedBy: adminUid, reviewedAt: serverTimestamp(),
+                approvedAt: serverTimestamp(), lastReviewId: reviewId, updatedAt: serverTimestamp(),
+            });
+            batch.set(doc(adminDb, "responderProfiles", pendingUid), {
+                uid: pendingUid, displayName: "Pending Applicant", email: "pend.prov@example.com",
+                responderSubtype: "VOLUNTEER", availabilityStatus: "UNAVAILABLE", dutyStatus: "OFF_DUTY",
+            });
+            batch.set(doc(adminDb, "responderApplicationReviews", reviewId), {
+                id: reviewId, applicantUid: pendingUid, applicantName: "Pending Applicant",
+                applicantEmail: "pend.prov@example.com", decision: "APPROVED",
+                requestedSubtype: "VOLUNTEER", assignedSubtype: "VOLUNTEER",
+                reviewerUid: adminUid, reviewerName: "Kethan Admin", reviewerRole: "COMMAND",
+                reviewerCommandLevel: "ADMINISTRATOR", reviewerDesignation: "Command Administrator",
+                previousStatus: "PENDING", newStatus: "APPROVED", reviewedAt: serverTimestamp(),
+            });
+            await assertSucceeds(batch.commit());
+
+            // Historical audit record cannot be modified or deleted
+            await assertFails(updateDoc(doc(adminDb, "responderApplicationReviews", reviewId), { reviewerName: "Tampered" }));
+            await assertFails(deleteDoc(doc(adminDb, "responderApplicationReviews", reviewId)));
+        });
+
+        it("PROV-06: Invitee atomic claim succeeds with trusted unit/subtype and rejects unit/role tampering", async () => {
+            const inviteeUid = "prov-invitee-01";
+            const invId = "inv-claim-resp-01";
+            await testEnv.withSecurityRulesDisabled(async (ctx) => {
+                await setDoc(doc(ctx.firestore(), "invitations", invId), {
+                    id: invId, email: "invitee@example.com", fullName: "Invited Responder",
+                    targetRole: "RESPONDER", targetCommandLevel: null, targetResponderSubtype: "PROFESSIONAL", targetUnit: "FIRE_HAZARD",
+                    status: "PENDING", invitedByUid: adminUid, invitedByName: "Kethan Admin",
+                    invitedByCommandLevel: "ADMINISTRATOR", createdAt: new Date(), expiresAt: new Date(Date.now() + 86400000),
+                });
+            });
+
+            const invDb = testEnv.authenticatedContext(inviteeUid, { email: "invitee@example.com", email_verified: true }).firestore();
+
+            // Tampering targetUnit (FIRE_HAZARD -> MEDICAL) must be DENIED
+            const badBatch = writeBatch(invDb);
+            badBatch.update(doc(invDb, "invitations", invId), { status: "CLAIMED", claimedByUid: inviteeUid, claimedAt: serverTimestamp(), updatedAt: serverTimestamp() });
+            badBatch.set(doc(invDb, "users", inviteeUid), {
+                uid: inviteeUid, displayName: "Invited Responder", email: "invitee@example.com",
+                role: "RESPONDER", commandLevel: null, responderSubtype: "PROFESSIONAL", requestedUnit: "MEDICAL",
+                capabilities: ["CITIZEN", "RESPONDER"], citizenEnrollmentStatus: "ACTIVE", responderApplicationStatus: "APPROVED",
+                approvalStatus: "APPROVED", dutyStatus: "OFF_DUTY", accountStatus: "ACTIVE", phoneVerified: false, emailVerified: true,
+                invitationId: invId, invitedByUid: adminUid, createdAt: serverTimestamp(), updatedAt: serverTimestamp(),
+            });
+            await assertFails(badBatch.commit());
+
+            // Valid atomic claim with matching trusted fields + invitee persona fields succeeds
+            const goodBatch = writeBatch(invDb);
+            goodBatch.update(doc(invDb, "invitations", invId), { status: "CLAIMED", claimedByUid: inviteeUid, claimedAt: serverTimestamp(), updatedAt: serverTimestamp() });
+            goodBatch.set(doc(invDb, "users", inviteeUid), {
+                uid: inviteeUid, displayName: "Invited Responder", email: "invitee@example.com",
+                role: "RESPONDER", commandLevel: null, responderSubtype: "PROFESSIONAL", requestedUnit: "FIRE_HAZARD",
+                capabilities: ["CITIZEN", "RESPONDER"], citizenEnrollmentStatus: "ACTIVE", responderApplicationStatus: "APPROVED",
+                approvalStatus: "APPROVED", dutyStatus: "OFF_DUTY", accountStatus: "ACTIVE", phoneVerified: false, emailVerified: true,
+                organization: "SDRF", designation: "Hazmat Lead", invitationId: invId, invitedByUid: adminUid,
+                createdAt: serverTimestamp(), updatedAt: serverTimestamp(),
+            });
+            await assertSucceeds(goodBatch.commit());
+        });
+
+        it("PROV-07: Admin can suspend/reactivate Coordinator and log immutable accountAuditLogs, but cannot self-suspend", async () => {
+            const adminDb = testEnv.authenticatedContext(adminUid, { email: "admin.prov@beaconmesh.org", email_verified: true }).firestore();
+            const coordDb = testEnv.authenticatedContext(coordUid, { email: "coord1.prov@beaconmesh.org", email_verified: true }).firestore();
+
+            // Admin suspends Coordinator + logs audit
+            const suspBatch = writeBatch(adminDb);
+            suspBatch.update(doc(adminDb, "users", coordUid), { accountStatus: "SUSPENDED", updatedAt: serverTimestamp() });
+            suspBatch.set(doc(adminDb, "accountAuditLogs", "aud-susp-coord-1"), {
+                id: "aud-susp-coord-1", targetUid: coordUid, action: "ACCOUNT_SUSPENDED",
+                actorUid: adminUid, actorName: "Kethan Admin", actorCommandLevel: "ADMINISTRATOR",
+                reason: "Shift rotation", createdAt: serverTimestamp(),
+            });
+            await assertSucceeds(suspBatch.commit());
+
+            // Admin cannot self-suspend
+            await assertFails(updateDoc(doc(adminDb, "users", adminUid), { accountStatus: "SUSPENDED", updatedAt: serverTimestamp() }));
+
+            // Coordinator cannot read or write accountAuditLogs
+            await assertFails(getDoc(doc(coordDb, "accountAuditLogs", "aud-susp-coord-1")));
+            await assertFails(updateDoc(doc(adminDb, "accountAuditLogs", "aud-susp-coord-1"), { reason: "Tampered" }));
+        });
+    });
+
+    describe("SOS Lifecycle Security & Atomic Consistency", () => {
+        const citizen1Uid = "sos-citizen-1";
+        const citizen2Uid = "sos-citizen-2";
+        const proRespUid = "sos-pro-resp-1";
+        const otherRespUid = "sos-pro-resp-2";
+        const volRespUid = "sos-vol-resp-1";
+        const coordUid = "sos-coord-1";
+        const sosIncId = "BM-2611-SOS01";
+        const asgId = `${sosIncId}_${proRespUid}`;
+
+        beforeEach(async () => {
+            const pastTime = new Date(Date.now() - 10000);
+            await testEnv.withSecurityRulesDisabled(async (context) => {
+                const fdb = context.firestore();
+                await setDoc(doc(fdb, "users", citizen1Uid), {
+                    uid: citizen1Uid, displayName: "Citizen One", email: "c1@example.com",
+                    role: "CITIZEN", capabilities: ["CITIZEN"], citizenEnrollmentStatus: "ACTIVE",
+                    approvalStatus: "NOT_REQUIRED", accountStatus: "ACTIVE", emailVerified: true, phoneVerified: false,
+                    createdAt: pastTime, updatedAt: pastTime,
+                });
+                await setDoc(doc(fdb, "users", citizen2Uid), {
+                    uid: citizen2Uid, displayName: "Citizen Two", email: "c2@example.com",
+                    role: "CITIZEN", capabilities: ["CITIZEN"], citizenEnrollmentStatus: "ACTIVE",
+                    approvalStatus: "NOT_REQUIRED", accountStatus: "ACTIVE", emailVerified: true, phoneVerified: false,
+                    createdAt: pastTime, updatedAt: pastTime,
+                });
+                await setDoc(doc(fdb, "users", proRespUid), {
+                    uid: proRespUid, displayName: "Pro Responder", email: "pro1@example.com",
+                    role: "RESPONDER", responderSubtype: "PROFESSIONAL", commandLevel: null, capabilities: ["CITIZEN", "RESPONDER"],
+                    citizenEnrollmentStatus: "ACTIVE", responderApplicationStatus: "APPROVED", approvalStatus: "APPROVED",
+                    dutyStatus: "AVAILABLE", activeIncidentId: null,
+                    accountStatus: "ACTIVE", emailVerified: true, phoneVerified: false,
+                    createdAt: pastTime, updatedAt: pastTime,
+                });
+                await setDoc(doc(fdb, "users", otherRespUid), {
+                    uid: otherRespUid, displayName: "Other Responder", email: "pro2@example.com",
+                    role: "RESPONDER", responderSubtype: "PROFESSIONAL", commandLevel: null, capabilities: ["CITIZEN", "RESPONDER"],
+                    citizenEnrollmentStatus: "ACTIVE", responderApplicationStatus: "APPROVED", approvalStatus: "APPROVED",
+                    dutyStatus: "AVAILABLE", activeIncidentId: null,
+                    accountStatus: "ACTIVE", emailVerified: true, phoneVerified: false,
+                    createdAt: pastTime, updatedAt: pastTime,
+                });
+                await setDoc(doc(fdb, "users", volRespUid), {
+                    uid: volRespUid, displayName: "Vol Responder", email: "vol1@example.com",
+                    role: "RESPONDER", responderSubtype: "VOLUNTEER", capabilities: ["CITIZEN", "RESPONDER"],
+                    citizenEnrollmentStatus: "ACTIVE", responderApplicationStatus: "APPROVED", approvalStatus: "APPROVED",
+                    dutyStatus: "AVAILABLE", activeIncidentId: null,
+                    accountStatus: "ACTIVE", emailVerified: true, phoneVerified: false,
+                    createdAt: pastTime, updatedAt: pastTime,
+                });
+                await setDoc(doc(fdb, "users", coordUid), {
+                    uid: coordUid, displayName: "Coordinator SOS", email: "coord.sos@example.com",
+                    role: "COMMAND", commandLevel: "COORDINATOR", capabilities: [],
+                    approvalStatus: "NOT_REQUIRED", accountStatus: "ACTIVE", emailVerified: true, phoneVerified: false,
+                    createdAt: pastTime, updatedAt: pastTime,
+                });
+                await setDoc(doc(fdb, "incidents", sosIncId), {
+                    id: sosIncId, type: "Medical", place: "Benz Circle, Vijayawada",
+                    description: "Cardiac emergency near flyover", status: "Waiting for connection",
+                    priority: "Critical", createdBy: citizen1Uid, assignedResponderId: null,
+                    createdAt: pastTime, updatedAt: pastTime,
+                });
+            });
+        });
+
+        it("SOS-01: Scoped incident read — owner and Command can read; other citizens, unassigned responders, and volunteers CANNOT", async () => {
+            const c1Db = testEnv.authenticatedContext(citizen1Uid, { email: "c1@example.com", email_verified: true }).firestore();
+            const c2Db = testEnv.authenticatedContext(citizen2Uid, { email: "c2@example.com", email_verified: true }).firestore();
+            const otherRespDb = testEnv.authenticatedContext(otherRespUid, { email: "pro2@example.com", email_verified: true }).firestore();
+            const volDb = testEnv.authenticatedContext(volRespUid, { email: "vol1@example.com", email_verified: true }).firestore();
+            const coordDb = testEnv.authenticatedContext(coordUid, { email: "coord.sos@example.com", email_verified: true }).firestore();
+
+            await assertSucceeds(getDoc(doc(c1Db, "incidents", sosIncId)));
+            await assertSucceeds(getDoc(doc(coordDb, "incidents", sosIncId)));
+            await assertFails(getDoc(doc(c2Db, "incidents", sosIncId)));
+            await assertFails(getDoc(doc(otherRespDb, "incidents", sosIncId)));
+            await assertFails(getDoc(doc(volDb, "incidents", sosIncId)));
+        });
+
+        it("SOS-02: Citizen cannot perform operational transitions; unassigned responder cannot update incident", async () => {
+            const c1Db = testEnv.authenticatedContext(citizen1Uid, { email: "c1@example.com", email_verified: true }).firestore();
+            const otherRespDb = testEnv.authenticatedContext(otherRespUid, { email: "pro2@example.com", email_verified: true }).firestore();
+
+            await assertFails(updateDoc(doc(c1Db, "incidents", sosIncId), { status: "Acknowledged", updatedAt: serverTimestamp() }));
+            await assertFails(updateDoc(doc(c1Db, "incidents", sosIncId), { status: "Resolved", updatedAt: serverTimestamp() }));
+            await assertFails(updateDoc(doc(otherRespDb, "incidents", sosIncId), { status: "In progress", updatedAt: serverTimestamp() }));
+        });
+
+        it("SOS-03: Command atomic dispatch -> Assigned responder accepts, progresses field status, and atomically completes", async () => {
+            const coordDb = testEnv.authenticatedContext(coordUid, { email: "coord.sos@example.com", email_verified: true }).firestore();
+            const proDb = testEnv.authenticatedContext(proRespUid, { email: "pro1@example.com", email_verified: true }).firestore();
+
+            // 1. Command atomic dispatch
+            const dispatchBatch = writeBatch(coordDb);
+            dispatchBatch.update(doc(coordDb, "incidents", sosIncId), {
+                status: "Acknowledged", assignedResponderId: proRespUid, updatedAt: serverTimestamp(),
+            });
+            dispatchBatch.update(doc(coordDb, "users", proRespUid), {
+                dutyStatus: "DISPATCHED", activeIncidentId: sosIncId, updatedAt: serverTimestamp(),
+            });
+            dispatchBatch.set(doc(coordDb, "incidentAssignments", asgId), {
+                id: asgId, incidentId: sosIncId, responderId: proRespUid,
+                status: "ACTIVE", acceptanceStatus: "OFFERED", assignedBy: coordUid,
+                assignedAt: serverTimestamp(), updatedAt: serverTimestamp(),
+            });
+            await assertSucceeds(dispatchBatch.commit());
+
+            // 2. Assigned responder can read & accept, then progress En route -> On scene -> In progress
+            await assertSucceeds(getDoc(doc(proDb, "incidents", sosIncId)));
+            await assertSucceeds(updateDoc(doc(proDb, "incidentAssignments", asgId), {
+                acceptanceStatus: "ACCEPTED", fieldStatus: "Acknowledged", respondedAt: serverTimestamp(), updatedAt: serverTimestamp(),
+            }));
+            await assertSucceeds(updateDoc(doc(proDb, "incidentAssignments", asgId), {
+                fieldStatus: "En route", updatedAt: serverTimestamp(),
+            }));
+            await assertSucceeds(updateDoc(doc(proDb, "incidents", sosIncId), {
+                status: "En route", updatedAt: serverTimestamp(),
+            }));
+            await assertSucceeds(updateDoc(doc(proDb, "incidentAssignments", asgId), {
+                fieldStatus: "On scene", updatedAt: serverTimestamp(),
+            }));
+            await assertSucceeds(updateDoc(doc(proDb, "incidentAssignments", asgId), {
+                fieldStatus: "In progress", updatedAt: serverTimestamp(),
+            }));
+
+            // 3. Assigned responder CANNOT modify protected fields on incidentAssignments or reassign incident
+            await assertFails(updateDoc(doc(proDb, "incidentAssignments", asgId), {
+                assignedBy: proRespUid, updatedAt: serverTimestamp(),
+            }));
+            await assertFails(updateDoc(doc(proDb, "incidents", sosIncId), {
+                assignedResponderId: otherRespUid, updatedAt: serverTimestamp(),
+            }));
+
+            // 4. Assigned responder atomically completes assignment & restores dutyStatus to AVAILABLE
+            const completeBatch = writeBatch(proDb);
+            completeBatch.update(doc(proDb, "incidents", sosIncId), { status: "Resolved", updatedAt: serverTimestamp() });
+            completeBatch.update(doc(proDb, "users", proRespUid), { dutyStatus: "AVAILABLE", activeIncidentId: null, updatedAt: serverTimestamp() });
+            completeBatch.update(doc(proDb, "incidentAssignments", asgId), { status: "COMPLETED", fieldStatus: "Resolved", completedAt: serverTimestamp(), updatedAt: serverTimestamp() });
+            await assertSucceeds(completeBatch.commit());
+
+            // 5. Append-only timeline: Command can create, update/delete are denied
+            const tlRef = doc(coordDb, "incidents", sosIncId, "timeline", "evt-close-1");
+            await assertSucceeds(setDoc(tlRef, {
+                id: "evt-close-1", incidentId: sosIncId, eventType: "INCIDENT_CLOSED",
+                actorUid: coordUid, actorRole: "COMMAND", details: "Verified and closed", createdAt: serverTimestamp(),
+            }));
+            await assertFails(updateDoc(tlRef, { details: "Tampered" }));
+        });
+
+        it("SOS-04: Assignment terminal locks & state-transition enforcement", async () => {
+            const coordDb = testEnv.authenticatedContext(coordUid, { email: "coord.sos@example.com", email_verified: true }).firestore();
+            const proDb = testEnv.authenticatedContext(proRespUid, { email: "pro1@example.com", email_verified: true }).firestore();
+
+            const dispatchBatch = writeBatch(coordDb);
+            dispatchBatch.update(doc(coordDb, "incidents", sosIncId), { status: "Acknowledged", assignedResponderId: proRespUid, updatedAt: serverTimestamp() });
+            dispatchBatch.update(doc(coordDb, "users", proRespUid), { dutyStatus: "DISPATCHED", activeIncidentId: sosIncId, updatedAt: serverTimestamp() });
+            dispatchBatch.set(doc(coordDb, "incidentAssignments", asgId), {
+                id: asgId, incidentId: sosIncId, responderId: proRespUid,
+                status: "ACTIVE", acceptanceStatus: "OFFERED", assignedBy: coordUid,
+                assignedAt: serverTimestamp(), updatedAt: serverTimestamp(),
+            });
+            await assertSucceeds(dispatchBatch.commit());
+
+            // Invalid field progression while OFFERED & invalid skip Acknowledged -> In progress
+            await assertFails(updateDoc(doc(proDb, "incidentAssignments", asgId), { fieldStatus: "En route", updatedAt: serverTimestamp() }));
+            await assertFails(updateDoc(doc(proDb, "incidentAssignments", asgId), { acceptanceStatus: "FORGED", updatedAt: serverTimestamp() }));
+            await assertFails(updateDoc(doc(proDb, "incidentAssignments", asgId), { status: "ARBITRARY", updatedAt: serverTimestamp() }));
+
+            await assertSucceeds(updateDoc(doc(proDb, "incidentAssignments", asgId), {
+                acceptanceStatus: "ACCEPTED", fieldStatus: "Acknowledged", respondedAt: serverTimestamp(), updatedAt: serverTimestamp(),
+            }));
+            await assertFails(updateDoc(doc(proDb, "incidentAssignments", asgId), { fieldStatus: "In progress", updatedAt: serverTimestamp() }));
+            await assertSucceeds(updateDoc(doc(proDb, "incidentAssignments", asgId), { fieldStatus: "En route", updatedAt: serverTimestamp() }));
+            await assertSucceeds(updateDoc(doc(proDb, "incidentAssignments", asgId), { fieldStatus: "On scene", updatedAt: serverTimestamp() }));
+            await assertSucceeds(updateDoc(doc(proDb, "incidentAssignments", asgId), { fieldStatus: "In progress", updatedAt: serverTimestamp() }));
+
+            const completeBatch = writeBatch(proDb);
+            completeBatch.update(doc(proDb, "incidents", sosIncId), { status: "Resolved", updatedAt: serverTimestamp() });
+            completeBatch.update(doc(proDb, "users", proRespUid), { dutyStatus: "AVAILABLE", activeIncidentId: null, updatedAt: serverTimestamp() });
+            completeBatch.update(doc(proDb, "incidentAssignments", asgId), { status: "COMPLETED", fieldStatus: "Resolved", completedAt: serverTimestamp(), updatedAt: serverTimestamp() });
+            await assertSucceeds(completeBatch.commit());
+
+            // Terminal lock: responder CANNOT modify COMPLETED assignment
+            await assertFails(updateDoc(doc(proDb, "incidentAssignments", asgId), { status: "ACTIVE", updatedAt: serverTimestamp() }));
+
+            // Terminal lock: responder CANNOT modify CANCELLED assignment
+            const cancelAsgId = `${sosIncId}_${otherRespUid}`;
+            await testEnv.withSecurityRulesDisabled(async (ctx) => {
+                await setDoc(doc(ctx.firestore(), "incidentAssignments", cancelAsgId), {
+                    id: cancelAsgId, incidentId: sosIncId, responderId: otherRespUid,
+                    status: "CANCELLED", acceptanceStatus: "ACCEPTED", assignedBy: coordUid,
+                    assignedAt: new Date(), updatedAt: new Date(),
+                });
+            });
+            const otherDb = testEnv.authenticatedContext(otherRespUid, { email: "pro2@example.com", email_verified: true }).firestore();
+            await assertFails(updateDoc(doc(otherDb, "incidentAssignments", cancelAsgId), { status: "ACTIVE", updatedAt: serverTimestamp() }));
+        });
+
+        it("SOS-05: Responder decline clears activeIncidentId, locks DECLINED assignment, and allows Command reassignment", async () => {
+            const coordDb = testEnv.authenticatedContext(coordUid, { email: "coord.sos@example.com", email_verified: true }).firestore();
+            const proDb = testEnv.authenticatedContext(proRespUid, { email: "pro1@example.com", email_verified: true }).firestore();
+
+            const dispatchBatch = writeBatch(coordDb);
+            dispatchBatch.update(doc(coordDb, "incidents", sosIncId), { status: "Acknowledged", assignedResponderId: proRespUid, updatedAt: serverTimestamp() });
+            dispatchBatch.update(doc(coordDb, "users", proRespUid), { dutyStatus: "DISPATCHED", activeIncidentId: sosIncId, updatedAt: serverTimestamp() });
+            dispatchBatch.set(doc(coordDb, "incidentAssignments", asgId), {
+                id: asgId, incidentId: sosIncId, responderId: proRespUid,
+                status: "ACTIVE", acceptanceStatus: "OFFERED", assignedBy: coordUid,
+                assignedAt: serverTimestamp(), updatedAt: serverTimestamp(),
+            });
+            await assertSucceeds(dispatchBatch.commit());
+
+            // Decline atomically
+            const declineBatch = writeBatch(proDb);
+            declineBatch.update(doc(proDb, "incidentAssignments", asgId), {
+                status: "DECLINED", acceptanceStatus: "DECLINED", declineReason: "Vehicle issue",
+                respondedAt: serverTimestamp(), updatedAt: serverTimestamp(),
+            });
+            declineBatch.update(doc(proDb, "users", proRespUid), {
+                dutyStatus: "AVAILABLE", activeIncidentId: null, updatedAt: serverTimestamp(),
+            });
+            await assertSucceeds(declineBatch.commit());
+
+            // Responder cannot modify DECLINED assignment
+            await assertFails(updateDoc(doc(proDb, "incidentAssignments", asgId), { status: "ACTIVE", updatedAt: serverTimestamp() }));
+
+            // Command can reassign to otherRespUid
+            const asg2Id = `${sosIncId}_${otherRespUid}`;
+            const reassignBatch = writeBatch(coordDb);
+            reassignBatch.update(doc(coordDb, "incidents", sosIncId), { status: "Acknowledged", assignedResponderId: otherRespUid, updatedAt: serverTimestamp() });
+            reassignBatch.update(doc(coordDb, "users", otherRespUid), { dutyStatus: "DISPATCHED", activeIncidentId: sosIncId, updatedAt: serverTimestamp() });
+            reassignBatch.set(doc(coordDb, "incidentAssignments", asg2Id), {
+                id: asg2Id, incidentId: sosIncId, responderId: otherRespUid,
+                status: "ACTIVE", acceptanceStatus: "OFFERED", assignedBy: coordUid,
+                assignedAt: serverTimestamp(), updatedAt: serverTimestamp(),
+            });
+            await assertSucceeds(reassignBatch.commit());
+        });
+
+        it("SOS-06: Timeline integrity — rejects actorRole spoofing, arbitrary eventType, backdated/future timestamps, and unauthorized actors", async () => {
+            const c1Db = testEnv.authenticatedContext(citizen1Uid, { email: "c1@example.com", email_verified: true }).firestore();
+            const c2Db = testEnv.authenticatedContext(citizen2Uid, { email: "c2@example.com", email_verified: true }).firestore();
+            const proDb = testEnv.authenticatedContext(proRespUid, { email: "pro1@example.com", email_verified: true }).firestore();
+            const coordDb = testEnv.authenticatedContext(coordUid, { email: "coord.sos@example.com", email_verified: true }).firestore();
+
+            // Citizen claiming actorRole COMMAND -> DENIED
+            await assertFails(setDoc(doc(c1Db, "incidents", sosIncId, "timeline", "evt-spoof-1"), {
+                id: "evt-spoof-1", incidentId: sosIncId, eventType: "INCIDENT_CLOSED",
+                actorUid: citizen1Uid, actorRole: "COMMAND", details: "Spoofed", createdAt: serverTimestamp(),
+            }));
+
+            // Responder claiming actorRole ADMINISTRATOR -> DENIED
+            await assertFails(setDoc(doc(proDb, "incidents", sosIncId, "timeline", "evt-spoof-2"), {
+                id: "evt-spoof-2", incidentId: sosIncId, eventType: "DISPATCH_CREATED",
+                actorUid: proRespUid, actorRole: "ADMINISTRATOR", details: "Spoofed", createdAt: serverTimestamp(),
+            }));
+
+            // Arbitrary eventType -> DENIED
+            await assertFails(setDoc(doc(coordDb, "incidents", sosIncId, "timeline", "evt-bad-type"), {
+                id: "evt-bad-type", incidentId: sosIncId, eventType: "HACKED_EVENT",
+                actorUid: coordUid, actorRole: "COMMAND", details: "Invalid type", createdAt: serverTimestamp(),
+            }));
+
+            // Backdated timestamp -> DENIED
+            await assertFails(setDoc(doc(coordDb, "incidents", sosIncId, "timeline", "evt-backdate"), {
+                id: "evt-backdate", incidentId: sosIncId, eventType: "INCIDENT_ACKNOWLEDGED",
+                actorUid: coordUid, actorRole: "COMMAND", details: "Backdated", createdAt: new Date(Date.now() - 60000),
+            }));
+
+            // Future timestamp -> DENIED
+            await assertFails(setDoc(doc(coordDb, "incidents", sosIncId, "timeline", "evt-future"), {
+                id: "evt-future", incidentId: sosIncId, eventType: "INCIDENT_ACKNOWLEDGED",
+                actorUid: coordUid, actorRole: "COMMAND", details: "Future", createdAt: new Date(Date.now() + 60000),
+            }));
+
+            // Unauthorized Citizen 2 creating event on Citizen 1's incident -> DENIED
+            await assertFails(setDoc(doc(c2Db, "incidents", sosIncId, "timeline", "evt-unauth"), {
+                id: "evt-unauth", incidentId: sosIncId, eventType: "SOS_CREATED",
+                actorUid: citizen2Uid, actorRole: "CITIZEN", details: "Unauthorized", createdAt: serverTimestamp(),
+            }));
+        });
+
+        it("AVAIL-01..06: Professional responder availability transitions, active lock, and role/ownership boundaries", async () => {
+            const proDb = testEnv.authenticatedContext(proRespUid, { email: "pro1@example.com", email_verified: true }).firestore();
+            const otherDb = testEnv.authenticatedContext(otherRespUid, { email: "pro2@example.com", email_verified: true }).firestore();
+            const c1Db = testEnv.authenticatedContext(citizen1Uid, { email: "c1@example.com", email_verified: true }).firestore();
+
+            // Seed proRespUid with legacy ON_DUTY status (matching live issue)
+            await testEnv.withSecurityRulesDisabled(async (ctx) => {
+                await updateDoc(doc(ctx.firestore(), "users", proRespUid), { dutyStatus: "ON_DUTY", activeIncidentId: null });
+            });
+
+            // AVAIL-01: Approved Active Professional responder transitions ON_DUTY -> AVAILABLE -> UNAVAILABLE -> AVAILABLE
+            await assertSucceeds(updateDoc(doc(proDb, "users", proRespUid), { dutyStatus: "AVAILABLE", updatedAt: serverTimestamp() }));
+            await assertSucceeds(updateDoc(doc(proDb, "users", proRespUid), { dutyStatus: "UNAVAILABLE", updatedAt: serverTimestamp() }));
+            await assertSucceeds(updateDoc(doc(proDb, "users", proRespUid), { dutyStatus: "AVAILABLE", updatedAt: serverTimestamp() }));
+
+            // AVAIL-04: Citizen cannot set dutyStatus on their own profile
+            await assertFails(updateDoc(doc(c1Db, "users", citizen1Uid), { dutyStatus: "AVAILABLE", updatedAt: serverTimestamp() }));
+
+            // AVAIL-06: Unauthorized user cannot modify another responder's availability
+            await assertFails(updateDoc(doc(otherDb, "users", proRespUid), { dutyStatus: "UNAVAILABLE", updatedAt: serverTimestamp() }));
+
+            // AVAIL-03: Active assigned responder cannot switch dutyStatus to AVAILABLE or OFF_DUTY
+            await testEnv.withSecurityRulesDisabled(async (ctx) => {
+                await updateDoc(doc(ctx.firestore(), "users", proRespUid), { dutyStatus: "DISPATCHED", activeIncidentId: sosIncId });
+            });
+            await assertFails(updateDoc(doc(proDb, "users", proRespUid), { dutyStatus: "AVAILABLE", updatedAt: serverTimestamp() }));
+            await assertFails(updateDoc(doc(proDb, "users", proRespUid), { dutyStatus: "OFF_DUTY", updatedAt: serverTimestamp() }));
+        });
+
+        it("NOTIF-01..06: Notification recipient isolation, trusted creator gates, and read-only mutations", async () => {
+            const c1Db = testEnv.authenticatedContext(citizen1Uid, { email: "c1@example.com", email_verified: true }).firestore();
+            const c2Db = testEnv.authenticatedContext(citizen2Uid, { email: "c2@example.com", email_verified: true }).firestore();
+            const coordDb = testEnv.authenticatedContext(coordUid, { email: "coord-sos@example.com", email_verified: true }).firestore();
+            const proDb = testEnv.authenticatedContext(proRespUid, { email: "pro1@example.com", email_verified: true }).firestore();
+            const otherDb = testEnv.authenticatedContext(otherRespUid, { email: "pro2@example.com", email_verified: true }).firestore();
+
+            // NOTIF-01: Citizen can create SOS_SYNCED notification ONLY for themselves on their own incident
+            const c1NotifId = `notif_SOS_SYNCED_${sosIncId}_${citizen1Uid}`;
+            await assertSucceeds(setDoc(doc(c1Db, "notifications", c1NotifId), {
+                notificationId: c1NotifId,
+                recipientUid: citizen1Uid,
+                eventType: "SOS_SYNCED",
+                title: "SOS synced",
+                message: "Your SOS report is synced.",
+                incidentId: sosIncId,
+                priority: "HIGH",
+                sourceActorUid: citizen1Uid,
+                dedupKey: `SOS_SYNCED:${sosIncId}`,
+                isRead: false,
+                readAt: null,
+                createdAt: serverTimestamp(),
+                metadata: {},
+            }));
+
+            // NOTIF-02: Citizen CANNOT manufacture Command notifications or notify another user
+            await assertFails(setDoc(doc(c1Db, "notifications", "notif_fake_cmd"), {
+                notificationId: "notif_fake_cmd",
+                recipientUid: coordUid,
+                eventType: "SOS_RECEIVED",
+                title: "Fake Command Alert",
+                message: "Spoofed alert",
+                incidentId: sosIncId,
+                priority: "CRITICAL",
+                sourceActorUid: citizen1Uid,
+                dedupKey: "FAKE:1",
+                isRead: false,
+                readAt: null,
+                createdAt: serverTimestamp(),
+                metadata: {},
+            }));
+
+            // NOTIF-03: User B (Citizen 2) CANNOT read User A's (Citizen 1) notification
+            await assertFails(getDoc(doc(c2Db, "notifications", c1NotifId)));
+            await assertSucceeds(getDoc(doc(c1Db, "notifications", c1NotifId)));
+
+            // NOTIF-04: Unassigned Responder CANNOT create notifications for Citizen 1 or Command
+            await assertFails(setDoc(doc(otherDb, "notifications", "notif_unassigned_resp"), {
+                notificationId: "notif_unassigned_resp",
+                recipientUid: citizen1Uid,
+                eventType: "RESPONDER_EN_ROUTE",
+                title: "Fake En Route",
+                message: "Unauthorized responder update",
+                incidentId: sosIncId,
+                priority: "HIGH",
+                sourceActorUid: otherRespUid,
+                dedupKey: "FAKE:RESP",
+                isRead: false,
+                readAt: null,
+                createdAt: serverTimestamp(),
+                metadata: {},
+            }));
+
+            // NOTIF-05: Command CAN create ASSIGNMENT_OFFERED for assigned responder
+            await testEnv.withSecurityRulesDisabled(async (ctx) => {
+                await setDoc(doc(ctx.firestore(), "incidentAssignments", `${sosIncId}_${proRespUid}`), {
+                    id: `${sosIncId}_${proRespUid}`,
+                    incidentId: sosIncId,
+                    responderId: proRespUid,
+                    status: "ACTIVE",
+                    acceptanceStatus: "OFFERED",
+                    assignedBy: coordUid,
+                    assignedAt: new Date(),
+                    updatedAt: new Date(),
+                });
+            });
+            const respNotifId = `notif_ASSIGNMENT_OFFERED_${sosIncId}_${proRespUid}`;
+            await assertSucceeds(setDoc(doc(coordDb, "notifications", respNotifId), {
+                notificationId: respNotifId,
+                recipientUid: proRespUid,
+                eventType: "ASSIGNMENT_OFFERED",
+                title: "New dispatch",
+                message: "You have been assigned to an incident.",
+                incidentId: sosIncId,
+                priority: "HIGH",
+                sourceActorUid: coordUid,
+                dedupKey: `ASSIGNMENT_OFFERED:${sosIncId}:${proRespUid}`,
+                isRead: false,
+                readAt: null,
+                createdAt: serverTimestamp(),
+                metadata: {},
+            }));
+
+            // NOTIF-06: Recipient can update ONLY isRead and readAt; cannot mutate protected fields or delete
+            await assertFails(updateDoc(doc(c1Db, "notifications", c1NotifId), {
+                title: "Tampered Title",
+                isRead: true,
+                readAt: serverTimestamp(),
+            }));
+            await assertFails(updateDoc(doc(c1Db, "notifications", c1NotifId), {
+                recipientUid: citizen2Uid,
+            }));
+            await assertSucceeds(updateDoc(doc(c1Db, "notifications", c1NotifId), {
+                isRead: true,
+                readAt: serverTimestamp(),
+            }));
+            await assertFails(deleteDoc(doc(c1Db, "notifications", c1NotifId)));
+            await assertFails(deleteDoc(doc(coordDb, "notifications", c1NotifId)));
         });
     });
 });

@@ -3,16 +3,37 @@ import { auth, db, isFirebaseConfigured } from "../firebase";
 import { getLocalDb } from "../db/dexie-db";
 import { enqueueOutboxItem } from "./sync-service";
 import { validateIncidentPayload, } from "../types/data-models";
+import {
+    NOTIFICATION_EVENTS,
+    createLocalNotification,
+    createNotificationIdempotent,
+    notifyCommandUsers,
+    reconcileCommandIncidentNotifications,
+} from "./notification-service";
+const INCIDENT_ID_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
 /**
- * Generate a clean, collision-free human-readable ID
- * format: BM-YYMM-RANDOM (e.g. BM-2611-4821)
+ * Generate a collision-resistant human-readable ID
+ * format: BM-YYMM-XXXXXX (32^6 = 1,073,741,824 combinations per month)
  */
 export function generateIncidentId() {
     const date = new Date();
     const year = date.getFullYear().toString().slice(-2);
     const month = (date.getMonth() + 1).toString().padStart(2, "0");
-    const rand = Math.floor(1000 + Math.random() * 9000);
-    return `BM-${year}${month}-${rand}`;
+    let suffix = "";
+    if (typeof globalThis !== "undefined" && globalThis.crypto?.getRandomValues) {
+        const bytes = new Uint8Array(6);
+        globalThis.crypto.getRandomValues(bytes);
+        for (let i = 0; i < 6; i++) {
+            suffix += INCIDENT_ID_ALPHABET[bytes[i] % INCIDENT_ID_ALPHABET.length];
+        }
+    }
+    else {
+        for (let i = 0; i < 6; i++) {
+            suffix += INCIDENT_ID_ALPHABET[Math.floor(Math.random() * INCIDENT_ID_ALPHABET.length)];
+        }
+    }
+    return `BM-${year}${month}-${suffix}`;
 }
 /**
  * Convert a Firestore document to canonical IncidentRecord
@@ -67,6 +88,7 @@ export function fromFirestoreIncident(data) {
         notes: data.notes || null,
         source: "CITIZEN_APP",
         syncStatus: "SYNCED",
+        syncError: data.syncError || null,
         createdAt: createdAtIso,
         updatedAt: updatedAtIso,
     };
@@ -140,6 +162,21 @@ export async function createEmergencyReport(input) {
             console.warn("[IncidentService] Local IndexedDB write failed:", err);
         }
     }
+    if (reporterId && reporterId !== "anon-citizen") {
+        void createLocalNotification({
+            recipientUid: reporterId,
+            eventType: NOTIFICATION_EVENTS.SOS_SAVED_LOCALLY,
+            title: `SOS ${id} saved on device`,
+            message: isOnline && auth?.currentUser
+                ? `Report ${id} is saved locally and queued for sync. Command has not confirmed receipt yet.`
+                : `Report ${id} is saved locally offline. Command has NOT received it yet; it will sync when connected.`,
+            incidentId: id,
+            priority: severity === "Critical" ? "CRITICAL" : "HIGH",
+            sourceActorUid: reporterId,
+            dedupKey: `SOS_SAVED_LOCALLY:${id}`,
+            metadata: { category: record.category, syncStatus: initialSyncStatus },
+        });
+    }
     // 2. Queue into Offline Outbox if authenticated or queue for later sync
     if (auth?.currentUser) {
         await enqueueOutboxItem("CREATE_INCIDENT", "incidents", id, {
@@ -163,9 +200,55 @@ export async function createEmergencyReport(input) {
  * Uses Firestore onSnapshot with automatic local IndexedDB merging and teardown.
  */
 export function subscribeToIncidents(options) {
-    const { role, userId, onUpdate, onError } = options;
+    const { role, userId, includeCitizenOwned = false, onUpdate, onError } = options;
     let isSubscribed = true;
-    let firestoreUnsubscribe = null;
+    const unsubscribes = [];
+    const remoteBuckets = {
+        primary: [],
+        citizenOwned: [],
+    };
+    const emitCombined = async () => {
+        if (!isSubscribed)
+            return;
+        const mergedMap = new Map();
+        for (const item of [...remoteBuckets.primary, ...remoteBuckets.citizenOwned]) {
+            mergedMap.set(item.id, item);
+        }
+        const remoteList = Array.from(mergedMap.values());
+        const localDb = getLocalDb();
+        if (localDb && remoteList.length > 0) {
+            try {
+                await localDb.incidents.bulkPut(remoteList);
+            }
+            catch {
+                // ignore
+            }
+        }
+        let localList = [];
+        if (localDb) {
+            try {
+                localList = await localDb.incidents.toArray();
+            }
+            catch {
+                localList = [];
+            }
+        }
+        const remoteIds = new Set(remoteList.map((r) => r.id));
+        const unsyncedLocals = localList.filter((l) => !remoteIds.has(l.id));
+        let combined = [...unsyncedLocals, ...remoteList];
+        if (role === "CITIZEN" && userId) {
+            combined = combined.filter((i) => i.reporterId === userId || i.createdBy === userId);
+        }
+        else if (role === "RESPONDER" && userId) {
+            combined = combined.filter((i) =>
+                i.assignedResponderId === userId ||
+                i.assignedResponderIds?.includes(userId) ||
+                (includeCitizenOwned && (i.reporterId === userId || i.createdBy === userId))
+            );
+        }
+        combined.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        onUpdate(combined);
+    };
     // Immediate load from local IndexedDB for zero latency
     const loadLocal = async () => {
         const localDb = getLocalDb();
@@ -176,7 +259,16 @@ export function subscribeToIncidents(options) {
             if (role === "CITIZEN" && userId) {
                 list = await localDb.incidents.where("reporterId").equals(userId).reverse().sortBy("createdAt");
             }
-            else {
+            else if (role === "RESPONDER" && userId) {
+                const allLocal = await localDb.incidents.toArray();
+                list = allLocal.filter((i) =>
+                    i.assignedResponderId === userId ||
+                    i.assignedResponderIds?.includes(userId) ||
+                    (includeCitizenOwned && (i.reporterId === userId || i.createdBy === userId))
+                );
+                list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+            }
+            else if (role === "COMMAND" || role === "COORDINATOR" || role === "ADMINISTRATOR") {
                 list = await localDb.incidents.toArray();
                 list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
             }
@@ -196,52 +288,47 @@ export function subscribeToIncidents(options) {
             if (role === "CITIZEN" && userId) {
                 q = query(collection(db, "incidents"), where("createdBy", "==", userId), limit(50));
             }
+            else if (role === "RESPONDER" && userId) {
+                // Responders only receive incidents explicitly assigned to them (enforced by firestore.rules)
+                q = query(collection(db, "incidents"), where("assignedResponderId", "==", userId), limit(50));
+            }
             else {
-                // Responders and Command coordinators receive the full real-time operational incident feed
+                // Command coordinators and administrators receive the real-time operational incident feed
                 q = query(collection(db, "incidents"), orderBy("createdAt", "desc"), limit(100));
             }
-            firestoreUnsubscribe = onSnapshot(q, async (snapshot) => {
+            unsubscribes.push(onSnapshot(q, async (snapshot) => {
                 if (!isSubscribed)
                     return;
-                const remoteList = [];
+                const list = [];
                 snapshot.forEach((docSnap) => {
-                    remoteList.push(fromFirestoreIncident(docSnap.data()));
+                    list.push(fromFirestoreIncident(docSnap.data()));
                 });
-                // Sync remote records into local IndexedDB
-                const localDb = getLocalDb();
-                if (localDb && remoteList.length > 0) {
-                    try {
-                        await localDb.incidents.bulkPut(remoteList);
-                    }
-                    catch {
-                        // ignore
-                    }
+                remoteBuckets.primary = list;
+                await emitCombined();
+                if (userId && ["COMMAND", "COORDINATOR", "ADMINISTRATOR"].includes(role)) {
+                    void reconcileCommandIncidentNotifications(list, userId);
                 }
-                // Combine with any local-only or un-synced incidents
-                let localList = [];
-                if (localDb) {
-                    try {
-                        localList = await localDb.incidents.toArray();
-                    }
-                    catch {
-                        localList = [];
-                    }
-                }
-                const remoteIds = new Set(remoteList.map((r) => r.id));
-                const unsyncedLocals = localList.filter((l) => !remoteIds.has(l.id));
-                let combined = [...unsyncedLocals, ...remoteList];
-                if (role === "CITIZEN" && userId) {
-                    combined = combined.filter((i) => i.reporterId === userId || i.createdBy === userId);
-                }
-                combined.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-                onUpdate(combined);
             }, (err) => {
                 console.info("[IncidentService] Real-time onSnapshot notice:", err.message);
                 if (onError && isSubscribed)
                     onError(err);
-                // Fallback to local IndexedDB on network or permission interruption
                 void loadLocal();
-            });
+            }));
+            if (role === "RESPONDER" && userId && includeCitizenOwned) {
+                const citizenQuery = query(collection(db, "incidents"), where("createdBy", "==", userId), limit(50));
+                unsubscribes.push(onSnapshot(citizenQuery, async (snapshot) => {
+                    if (!isSubscribed)
+                        return;
+                    const list = [];
+                    snapshot.forEach((docSnap) => {
+                        list.push(fromFirestoreIncident(docSnap.data()));
+                    });
+                    remoteBuckets.citizenOwned = list;
+                    await emitCombined();
+                }, () => {
+                    // ignore secondary listener error if primary succeeds
+                }));
+            }
         }
         catch (err) {
             console.warn("[IncidentService] Failed to establish real-time listener:", err);
@@ -252,69 +339,72 @@ export function subscribeToIncidents(options) {
     // Cleanup function removing listener and preventing memory leaks
     return () => {
         isSubscribed = false;
-        if (typeof firestoreUnsubscribe === "function") {
-            firestoreUnsubscribe();
-            firestoreUnsubscribe = null;
+        while (unsubscribes.length > 0) {
+            const unsub = unsubscribes.pop();
+            if (typeof unsub === "function")
+                unsub();
         }
     };
 }
 /**
- * Assign an incident to a designated responder (Command Authorized)
+ * Retired legacy non-atomic assignment path.
+ * Command dispatch must use `assignIncidentAtomic` in command-service.js.
  */
 export async function assignIncidentToResponder(incidentId, responderId, responderName, assignedBy) {
-    const now = new Date().toISOString();
-    const coordinatorUid = assignedBy || auth?.currentUser?.uid || "command-coordinator";
-    // 1. Update local IndexedDB
-    const localDb = getLocalDb();
-    if (localDb) {
-        try {
-            const inc = await localDb.incidents.get(incidentId);
-            if (inc) {
-                await localDb.incidents.update(incidentId, {
-                    status: "Acknowledged",
-                    assignedResponderIds: [responderId],
-                    assignedResponderId: responderId,
-                    updatedAt: now,
-                });
-            }
-        }
-        catch (err) {
-            console.warn("[IncidentService] Local assignment update failed:", err);
-        }
-    }
-    // 2. Commit to Firestore if online
-    if (isFirebaseConfigured && db && typeof navigator !== "undefined" && navigator.onLine && auth?.currentUser) {
-        try {
-            const incRef = doc(db, "incidents", incidentId);
-            await updateDoc(incRef, {
-                assignedResponderId: responderId,
-                status: "Acknowledged",
-                updatedAt: serverTimestamp(),
-            });
-            // Create incidentAssignment record
-            const asgId = `asg-${incidentId}-${responderId}`;
-            const asgRef = doc(db, "incidentAssignments", asgId);
-            await setDoc(asgRef, {
-                id: asgId,
-                incidentId,
-                responderId,
-                responderName: responderName || "Responder",
-                assignedBy: coordinatorUid,
-                assignmentStatus: "ASSIGNED",
-                assignedAt: serverTimestamp(),
-                updatedAt: serverTimestamp(),
-            }, { merge: true });
-            return;
-        }
-        catch (err) {
-            console.warn("[IncidentService] Firestore assign update deferred to outbox:", err);
-        }
-    }
-    // Queue to outbox if offline or failed
-    await enqueueOutboxItem("ASSIGN_INCIDENT", "incidents", incidentId, {
-        assignedResponderId: responderId,
-        status: "Acknowledged",
+    const { assignIncidentAtomic } = await import("./command-service");
+    return assignIncidentAtomic(incidentId, responderId, assignedBy || auth?.currentUser?.uid || "command-coordinator", {
+        responderName,
     });
+}
+/**
+ * Append an immutable operational event to `incidents/{incidentId}/timeline/{eventId}`
+ */
+export async function appendIncidentTimelineEvent(incidentId, event) {
+    if (!isFirebaseConfigured || !db || !auth?.currentUser || !incidentId)
+        return null;
+    const eventId = `evt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const payload = {
+        id: eventId,
+        incidentId,
+        eventType: event.eventType,
+        actorUid: event.actorUid || auth.currentUser.uid,
+        actorRole: event.actorRole || "CITIZEN",
+        details: event.details || "",
+        createdAt: serverTimestamp(),
+    };
+    await setDoc(doc(db, "incidents", incidentId, "timeline", eventId), payload);
+    return payload;
+}
+/**
+ * Subscribe to the append-only operational timeline for a single incident
+ */
+export function subscribeToIncidentTimeline(incidentId, onUpdate, onError) {
+    if (!isFirebaseConfigured || !db || !auth?.currentUser || !incidentId) {
+        onUpdate([]);
+        return () => { };
+    }
+    try {
+        const q = query(collection(db, "incidents", incidentId, "timeline"), orderBy("createdAt", "asc"), limit(50));
+        return onSnapshot(q, (snap) => {
+            const events = [];
+            snap.forEach((d) => {
+                const data = d.data();
+                events.push({
+                    ...data,
+                    createdAtIso: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : (data.createdAt || null),
+                });
+            });
+            onUpdate(events);
+        }, (err) => {
+            if (onError)
+                onError(err);
+        });
+    }
+    catch (err) {
+        if (onError)
+            onError(err);
+        return () => { };
+    }
 }
 /**
  * Update the status of an incident
@@ -353,6 +443,35 @@ export async function updateIncidentStatus(incidentId, newStatus, notes, updated
             if (notes)
                 cloudUpdates.notes = notes;
             await updateDoc(incRef, cloudUpdates);
+            if (newStatus === "Acknowledged") {
+                const actorUid = updatedBy || auth.currentUser.uid;
+                const incSnap = await (await import("firebase/firestore")).getDoc(incRef);
+                const incData = incSnap.exists() ? incSnap.data() : null;
+                if (incData?.createdBy && incData.createdBy !== actorUid) {
+                    void createNotificationIdempotent({
+                        recipientUid: incData.createdBy,
+                        eventType: NOTIFICATION_EVENTS.INCIDENT_ACKNOWLEDGED,
+                        title: `Incident ${incidentId} acknowledged`,
+                        message: `Command Operations has acknowledged your ${incData.type || "SOS"} report.`,
+                        incidentId,
+                        priority: "HIGH",
+                        sourceActorUid: actorUid,
+                        dedupKey: `INCIDENT_ACKNOWLEDGED:${incidentId}`,
+                        metadata: { status: "Acknowledged" },
+                    });
+                }
+                void notifyCommandUsers({
+                    eventType: NOTIFICATION_EVENTS.INCIDENT_ACKNOWLEDGED,
+                    title: `Incident ${incidentId} acknowledged`,
+                    message: `Incident ${incidentId} was acknowledged by Command Operations.`,
+                    incidentId,
+                    priority: "NORMAL",
+                    sourceActorUid: actorUid,
+                    excludeActorUid: actorUid,
+                    dedupKey: `INCIDENT_ACKNOWLEDGED:${incidentId}`,
+                    metadata: { status: "Acknowledged" },
+                });
+            }
             return;
         }
         catch (err) {

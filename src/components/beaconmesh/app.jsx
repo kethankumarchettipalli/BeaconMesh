@@ -4,6 +4,9 @@ import { Activity, AlertTriangle, ArrowDownRight, ArrowRight, Bell, CircleHelp, 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from "@/components/ui/sheet";
+import { useIsMobile } from "@/hooks/use-mobile";
 import beaconIcon from "@/assets/beacon-network-icon.png.asset.json";
 import beaconWordmark from "@/assets/beaconmesh-wordmark.png.asset.json";
 import heroImage from "@/assets/beaconmesh-hero.jpg";
@@ -12,11 +15,24 @@ import { LoginForm, SignupForm, VerifyEmailForm, ForgotPasswordForm } from "./au
 import { RegistrationWizard } from "./registration-wizard";
 import { HeroCinematicAnimation } from "./hero-cinematic-animation";
 import { WORKSPACE_ROUTES } from "@/lib/auth-types";
-import { createEmergencyReport, getUserIncidents, getAllIncidents, updateIncidentStatus, assignIncidentToResponder, subscribeToIncidents, } from "@/lib/services/incident-service";
+import { createEmergencyReport, getUserIncidents, getAllIncidents, updateIncidentStatus, subscribeToIncidents, appendIncidentTimelineEvent, subscribeToIncidentTimeline, } from "@/lib/services/incident-service";
 import { createAndVerifySafeZone, subscribeToSafeZones, } from "@/lib/services/safezone-service";
 import { getResponderProfile, setResponderAvailability, } from "@/lib/services/responder-service";
-import { computeIncidentAggregates, getOperationalUserDirectory, fetchPendingResponderApplications, approveResponderApplication, rejectResponderApplication, } from "@/lib/services/command-service";
-import { initAutoSync } from "@/lib/services/sync-service";
+import { computeIncidentAggregates, getOperationalUserDirectory, fetchPendingResponderApplications, approveResponderApplication, rejectResponderApplication, fetchRecentApplicationReviews, createPersonnelInvitation, fetchPersonnelInvitations, revokePersonnelInvitation, suspendUserAccount, reactivateUserAccount, fetchAccountAuditHistory, fetchReviewById, assignIncidentAtomic, completeIncidentAtomic, respondToAssignmentOffer, updateResponderFieldProgress, verifyAndCloseIncident, subscribeToResponderAssignments, subscribeToIncidentAssignments, RESPONDER_FIELD_SEQUENCE, } from "@/lib/services/command-service";
+import { initAutoSync, flushOutbox } from "@/lib/services/sync-service";
+import { NotificationCenter } from "./notification-center";
+import { subscribeToUserNotifications, markNotificationAsRead, markAllNotificationsAsRead } from "@/lib/services/notification-service";
+import {
+  SIMULATION_SCENARIOS,
+  getSimulationState,
+  subscribeSimulation,
+  initializeSimulation,
+  stepSimulation,
+  startSimulation,
+  pauseSimulation,
+  resetSimulation,
+  injectSimulationMessage,
+} from "@/lib/services/simulation-service";
 const BeaconMapConsole = lazy(() => import("@/components/gis/BeaconMapConsole").then((m) => ({
   default: m.BeaconMapConsole,
 })));
@@ -50,8 +66,11 @@ export function toDisplayIncident(rec) {
     priority: rec.severity,
     description: rec.description,
     reporterId: rec.reporterId,
-    assignedResponderIds: rec.assignedResponderIds || [],
+    assignedResponderId: rec.assignedResponderId || null,
+    assignedResponderIds: rec.assignedResponderIds || (rec.assignedResponderId ? [rec.assignedResponderId] : []),
+    notes: rec.notes || null,
     syncStatus: rec.syncStatus,
+    syncError: rec.syncError || null,
   };
 }
 function isIncident(value) {
@@ -429,9 +448,9 @@ function Stat({ label, value, hint, tone = "default", }) {
   </div>);
 }
 function IncidentRow({ incident, onOpen, }) {
-  const statusTone = incident.status === "Acknowledged" || incident.status === "Resolved"
+  const statusTone = incident.status === "Acknowledged" || incident.status === "Resolved" || incident.status === "Closed"
     ? "good"
-    : incident.status === "Waiting for connection"
+    : incident.status === "Waiting for connection" || incident.status === "Saved on device" || incident.syncStatus === "SYNC_FAILED"
       ? "warn"
       : "signal";
   return (<button type="button" onClick={() => onOpen(incident)} className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-b border-border py-4 text-left transition-colors hover:bg-muted/40 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
@@ -441,6 +460,8 @@ function IncidentRow({ incident, onOpen, }) {
         <Pill tone={incident.priority === "Critical" ? "warn" : "neutral"}>
           {incident.priority}
         </Pill>
+        {incident.syncStatus === "SYNC_FAILED" && <Pill tone="warn">Sync failed</Pill>}
+        {incident.syncStatus === "LOCAL_ONLY" && <Pill tone="neutral">Offline local</Pill>}
       </span>
       <span className="mt-1.5 block truncate text-sm font-medium">
         {incident.type} · {incident.place}
@@ -495,8 +516,50 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
   const [query, setQuery] = useState("");
   const [activeScenario, setActiveScenario] = useState("Normal connectivity");
   const [playing, setPlaying] = useState(false);
+  const [simState, setSimState] = useState(() => getSimulationState());
+  const [simSearch, setSimSearch] = useState("");
+  const [selectedSimMsgId, setSelectedSimMsgId] = useState(null);
+  const [simTtl, setSimTtl] = useState(12);
+  useEffect(() => {
+    const unsub = subscribeSimulation((next) => {
+      setSimState(next);
+      setActiveScenario(next.scenario);
+      setPlaying(next.isPlaying);
+    });
+    return () => {
+      if (typeof unsub === "function")
+        unsub();
+    };
+  }, []);
   const [selected, setSelected] = useState(null);
-  const [available, setAvailable] = useState(true);
+  const searchIncidentId = useRouterState({
+    select: (s) => {
+      const searchStr = typeof s.location.searchStr === "string" ? s.location.searchStr : "";
+      if (searchStr) {
+        return new URLSearchParams(searchStr).get("incident") || "";
+      }
+      if (s.location.search && typeof s.location.search === "object" && "incident" in s.location.search) {
+        return String(s.location.search.incident || "");
+      }
+      return "";
+    },
+  });
+  useEffect(() => {
+    if (!searchIncidentId || incidents.length === 0)
+      return;
+    const match = incidents.find((item) => item.id === searchIncidentId);
+    if (match) {
+      setSelected(match);
+    }
+  }, [searchIncidentId, incidents]);
+  const [available, setAvailable] = useState(profile?.dutyStatus === "AVAILABLE");
+  const [availabilitySaving, setAvailabilitySaving] = useState(false);
+  const [availabilityError, setAvailabilityError] = useState("");
+  const [myAssignments, setMyAssignments] = useState([]);
+  const [assignmentsStatus, setAssignmentsStatus] = useState("loading");
+  const [fieldNote, setFieldNote] = useState("");
+  const [declineReason, setDeclineReason] = useState("");
+  const [actionLoading, setActionLoading] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [locationLabel, setLocationLabel] = useState("Location coordinates unconfirmed");
   const [manualAddress, setManualAddress] = useState("");
@@ -504,8 +567,25 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
   const [safeZones, setSafeZones] = useState([]);
   const [operationalUsers, setOperationalUsers] = useState([]);
   const [pendingApplications, setPendingApplications] = useState([]);
+  const [recentReviews, setRecentReviews] = useState([]);
+  const [invitations, setInvitations] = useState([]);
   const [loadingApplications, setLoadingApplications] = useState(false);
   const [usersTab, setUsersTab] = useState("directory");
+  const isMobile = useIsMobile();
+  const [provName, setProvName] = useState("");
+  const [provEmail, setProvEmail] = useState("");
+  const [provTrack, setProvTrack] = useState("COMMAND:COORDINATOR");
+  const [provUnit, setProvUnit] = useState("GENERAL");
+  const [provSubmitting, setProvSubmitting] = useState(false);
+  const [provResult, setProvResult] = useState(null);
+  const [provCopied, setProvCopied] = useState(false);
+  const [managedUser, setManagedUser] = useState(null);
+  const [manageAuditLogs, setManageAuditLogs] = useState([]);
+  const [manageApprovalRecord, setManageApprovalRecord] = useState(null);
+  const [manageLoadingAudit, setManageLoadingAudit] = useState(false);
+  const [manageActionMode, setManageActionMode] = useState(null); // "suspend" | "reactivate" | null
+  const [suspendReason, setSuspendReason] = useState("");
+  const [manageSubmitting, setManageSubmitting] = useState(false);
   const [reviewModal, setReviewModal] = useState(null);
   const [reviewSubtype, setReviewSubtype] = useState("VOLUNTEER");
   const [rejectionReason, setRejectionReason] = useState("");
@@ -528,13 +608,18 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
   const refreshUsersAndApplications = async () => {
     setLoadingApplications(true);
     try {
-      const [users, apps] = await Promise.all([
-        getOperationalUserDirectory(),
+      const [users, apps, reviews, invites] = await Promise.all([
+        getOperationalUserDirectory(role),
         fetchPendingResponderApplications(),
+        fetchRecentApplicationReviews(),
+        role === "ADMINISTRATOR" ? fetchPersonnelInvitations().catch(() => []) : Promise.resolve([]),
       ]);
-      if (users && users.length > 0)
-        setOperationalUsers(users);
+      setOperationalUsers(users || []);
       setPendingApplications(apps || []);
+      setRecentReviews(reviews || []);
+      if (role === "ADMINISTRATOR") {
+        setInvitations(invites || []);
+      }
     } catch (err) {
       console.warn("Refresh users/applications failed:", err);
     } finally {
@@ -635,33 +720,58 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
       if (mounted)
         setSafeZones(zones);
     });
-    getOperationalUserDirectory()
-      .then((users) => {
-        if (mounted && users && users.length > 0)
-          setOperationalUsers(users);
-      })
-      .catch((err) => console.warn("Operational users load failed:", err));
-    fetchPendingResponderApplications()
-      .then((apps) => {
-        if (mounted && apps)
-          setPendingApplications(apps);
-      })
-      .catch((err) => console.warn("Pending responder applications load failed:", err));
-    if (user?.uid) {
-      getResponderProfile(user.uid)
-        .then((resp) => {
-          if (mounted && resp)
-            setAvailable(resp.isAvailable);
+    const isCommandRole = role === "COORDINATOR" || role === "ADMINISTRATOR";
+    if (isCommandRole) {
+      getOperationalUserDirectory(role)
+        .then((users) => {
+          if (mounted && users && users.length > 0)
+            setOperationalUsers(users);
         })
-        .catch((err) => console.warn("Responder profile load failed:", err));
+        .catch((err) => console.warn("Operational users load failed:", err));
+      fetchPendingResponderApplications()
+        .then((apps) => {
+          if (mounted && apps)
+            setPendingApplications(apps);
+        })
+        .catch((err) => console.warn("Pending responder applications load failed:", err));
+    }
+    let unsubAssignments = null;
+    if (user?.uid && role === "RESPONDER") {
+      if (profile?.dutyStatus) {
+        setAvailable(profile.dutyStatus === "AVAILABLE");
+      }
+      else {
+        getResponderProfile(user.uid)
+          .then((resp) => {
+            if (mounted && resp)
+              setAvailable(resp.isAvailable);
+          })
+          .catch((err) => console.warn("Responder profile load failed:", err));
+      }
+      setAssignmentsStatus("loading");
+      unsubAssignments = subscribeToResponderAssignments(user.uid, (list) => {
+        if (mounted) {
+          setMyAssignments(list || []);
+          setAssignmentsStatus("ready");
+        }
+      }, () => {
+        if (mounted)
+          setAssignmentsStatus("error");
+      });
+    }
+    else {
+      setAssignmentsStatus("ready");
     }
     return () => {
       mounted = false;
       if (typeof unsubSafeZones === "function") {
         unsubSafeZones();
       }
+      if (typeof unsubAssignments === "function") {
+        unsubAssignments();
+      }
     };
-  }, [user?.uid]);
+  }, [user?.uid, role, profile?.dutyStatus]);
   const command = role === "COORDINATOR" || role === "ADMINISTRATOR";
   const roleKey = role === "CITIZEN" ? "CITIZEN" : role === "RESPONDER" ? "RESPONDER" : "COMMAND";
   const visibleIncidents = useMemo(() => incidents.filter((incident) => `${incident.id} ${incident.type} ${incident.place} ${incident.status}`
@@ -688,8 +798,10 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
   };
   const createIncident = async (event) => {
     event.preventDefault();
-    if (!description.trim()) {
-      setMessage("Please enter a short description of what happened.");
+    if (isSubmitting)
+      return;
+    if (!description.trim() || description.trim().length < 5) {
+      setMessage("Please enter a description of at least 5 characters.");
       return;
     }
     setIsSubmitting(true);
@@ -735,12 +847,20 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
       const displayInc = toDisplayIncident(record);
       setIncidents([displayInc, ...incidents]);
       setDescription("");
-      const syncStatusText = record.syncStatus === "SYNCED"
-        ? "synced to Cloud"
-        : record.syncStatus === "PENDING_SYNC"
-          ? "queued for Cloud sync"
-          : "stored locally on device (offline)";
-      setMessage(`Report ${record.id} registered (${syncStatusText}).`);
+      if (typeof navigator !== "undefined" && navigator.onLine && user?.uid) {
+        const syncRes = await flushOutbox();
+        if (syncRes.failed > 0) {
+          setIncidents((prev) => prev.map((item) => (item.id === record.id ? { ...item, syncStatus: "SYNC_FAILED", syncError: "Cloud sync failed; queued for retry." } : item)));
+          setMessage(`Report ${record.id} saved on device, but Cloud sync failed. It will retry automatically.`);
+        }
+        else {
+          setIncidents((prev) => prev.map((item) => (item.id === record.id ? { ...item, syncStatus: "SYNCED", status: "Waiting for connection", syncError: null } : item)));
+          setMessage(`Report ${record.id} saved on device and transmitted to Command.`);
+        }
+      }
+      else {
+        setMessage(`Report ${record.id} saved locally on device (offline). It will sync automatically when reconnected.`);
+      }
       if (onRefresh)
         onRefresh();
     }
@@ -751,8 +871,8 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
       setIsSubmitting(false);
     }
   };
-  const setStatus = async (status) => {
-    if (!selected)
+  const setStatus = async (status, notesText = undefined) => {
+    if (!selected || !command)
       return;
     let canonicalStatus = "Waiting for connection";
     if (status.includes("Acknowledged"))
@@ -761,55 +881,158 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
       canonicalStatus = "In progress";
     else if (status.includes("Resolved"))
       canonicalStatus = "Resolved";
+    else if (status.includes("Closed"))
+      canonicalStatus = "Closed";
     else if (status.includes("Saved"))
       canonicalStatus = "Saved on device";
+    setActionLoading(true);
     try {
-      await updateIncidentStatus(selected.id, canonicalStatus, undefined, user?.uid || "operator");
-      setIncidents(incidents.map((item) => (item.id === selected.id ? { ...item, status } : item)));
-      setSelected({ ...selected, status });
-      setMessage(`${selected.id} updated to ${status}.`);
-      if (onRefresh)
-        onRefresh();
-    }
-    catch {
-      setIncidents(incidents.map((item) => (item.id === selected.id ? { ...item, status } : item)));
-      setSelected({ ...selected, status });
-      setMessage(`${selected.id} updated locally.`);
-    }
-  };
-  const handleAssignResponder = async (responderId, responderName) => {
-    if (!selected)
-      return;
-    try {
-      await assignIncidentToResponder(selected.id, responderId, responderName, user?.uid || "command-coordinator");
-      setIncidents(incidents.map((item) => item.id === selected.id
-        ? { ...item, status: "Acknowledged", assignedResponderIds: [responderId] }
-        : item));
-      setSelected({
-        ...selected,
-        status: "Acknowledged",
-        assignedResponderIds: [responderId],
-      });
-      setMessage(`Assigned ${selected.id} to ${responderName}.`);
+      await updateIncidentStatus(selected.id, canonicalStatus, notesText, user?.uid || "operator");
+      await appendIncidentTimelineEvent(selected.id, {
+        eventType: canonicalStatus === "Acknowledged" ? "INCIDENT_ACKNOWLEDGED" : "STATUS_UPDATED",
+        actorUid: user?.uid,
+        actorRole: "COMMAND",
+        details: notesText ? `${canonicalStatus}: ${notesText}` : `Command updated status to ${canonicalStatus}`,
+      }).catch(() => {});
+      setIncidents(incidents.map((item) => (item.id === selected.id ? { ...item, status: canonicalStatus } : item)));
+      setSelected({ ...selected, status: canonicalStatus });
+      setMessage(`${selected.id} updated to ${canonicalStatus}.`);
       if (onRefresh)
         onRefresh();
     }
     catch (err) {
-      setMessage(`Failed to assign responder: ${err.message}`);
+      setMessage(`Failed to update ${selected.id}: ${err?.message || "Permission denied"}`);
+    }
+    finally {
+      setActionLoading(false);
+    }
+  };
+  const handleAssignResponder = async (responderId, responderName) => {
+    if (!selected || !command || !user?.uid)
+      return;
+    setActionLoading(true);
+    try {
+      await assignIncidentAtomic(selected.id, responderId, user.uid, { responderName });
+      setIncidents(incidents.map((item) => item.id === selected.id
+        ? { ...item, status: "Acknowledged", assignedResponderId: responderId, assignedResponderIds: [responderId] }
+        : item));
+      setSelected({
+        ...selected,
+        status: "Acknowledged",
+        assignedResponderId: responderId,
+        assignedResponderIds: [responderId],
+      });
+      setMessage(`Dispatched ${selected.id} to ${responderName} (awaiting responder acceptance).`);
+      await refreshUsersAndApplications();
+      if (onRefresh)
+        onRefresh();
+    }
+    catch (err) {
+      setMessage(`Dispatch failed: ${err?.message || "Permission denied or responder unavailable"}`);
+    }
+    finally {
+      setActionLoading(false);
+    }
+  };
+  const handleCloseIncident = async (closingNotes) => {
+    if (!selected || !command || !user?.uid)
+      return;
+    setActionLoading(true);
+    try {
+      await verifyAndCloseIncident(selected.id, user.uid, closingNotes);
+      setIncidents(incidents.map((item) => (item.id === selected.id ? { ...item, status: "Closed" } : item)));
+      setSelected({ ...selected, status: "Closed" });
+      setMessage(`${selected.id} verified and closed by Command.`);
+      await refreshUsersAndApplications();
+      if (onRefresh)
+        onRefresh();
+    }
+    catch (err) {
+      setMessage(`Closure failed: ${err?.message || "Permission denied"}`);
+    }
+    finally {
+      setActionLoading(false);
+    }
+  };
+  const handleResponderDecision = async (incidentId, decision, reason = null) => {
+    if (!user?.uid)
+      return;
+    setActionLoading(true);
+    try {
+      await respondToAssignmentOffer(incidentId, user.uid, decision, reason);
+      setMessage(decision === "ACCEPTED"
+        ? `Accepted assignment for ${incidentId}.`
+        : `Declined assignment for ${incidentId}. Command has been notified to reassign.`);
+      if (decision === "DECLINED" && selected?.id === incidentId) {
+        setSelected(null);
+      }
+      if (onRefresh)
+        onRefresh();
+    }
+    catch (err) {
+      setMessage(`Assignment response failed: ${err?.message || "Permission denied"}`);
+    }
+    finally {
+      setActionLoading(false);
+    }
+  };
+  const handleResponderFieldStep = async (incidentId, nextStatus, notesText = null) => {
+    if (!user?.uid)
+      return;
+    setActionLoading(true);
+    try {
+      const restoreStatus = available ? "AVAILABLE" : "UNAVAILABLE";
+      await updateResponderFieldProgress(incidentId, user.uid, nextStatus, notesText, restoreStatus);
+      setIncidents(incidents.map((item) => (item.id === incidentId ? { ...item, status: nextStatus } : item)));
+      if (selected?.id === incidentId) {
+        setSelected({ ...selected, status: nextStatus, ...(notesText ? { notes: notesText } : {}) });
+      }
+      if (nextStatus === "Resolved") {
+        setMessage(`${incidentId} marked Resolved and your availability was restored to ${restoreStatus}.`);
+      }
+      else {
+        setMessage(`${incidentId} updated to "${nextStatus}".`);
+      }
+      if (onRefresh)
+        onRefresh();
+    }
+    catch (err) {
+      setMessage(`Status update rejected: ${err?.message || "Invalid transition or permission denied"}`);
+    }
+    finally {
+      setActionLoading(false);
     }
   };
   const toggleAvailability = async () => {
-    const nextVal = !available;
-    setAvailable(nextVal);
+    if (availabilitySaving)
+      return;
+    const prevVal = available;
+    const nextVal = !prevVal;
+    setAvailabilityError("");
+    setAvailabilitySaving(true);
     if (user?.uid) {
       try {
-        await setResponderAvailability(user.uid, nextVal);
+        const persisted = await setResponderAvailability(user.uid, nextVal);
+        setAvailable(persisted === "AVAILABLE");
+        setMessage(`Responder availability set to ${persisted === "AVAILABLE" ? "Available" : "Unavailable"}.`);
+        if (onRefresh)
+          onRefresh();
       }
       catch (e) {
-        console.warn("Failed to sync responder availability:", e);
+        setAvailable(prevVal);
+        const errMsg = `Cannot change availability: ${e?.message || "Permission denied."}`;
+        setAvailabilityError(errMsg);
+        setMessage("");
+      }
+      finally {
+        setAvailabilitySaving(false);
       }
     }
-    setMessage(`Responder availability set to ${nextVal ? "Available" : "Unavailable"}.`);
+    else {
+      setAvailable(nextVal);
+      setMessage(`Responder availability set to ${nextVal ? "Available" : "Unavailable"}.`);
+      setAvailabilitySaving(false);
+    }
   };
   const handleSavePreferences = async (e) => {
     e.preventDefault();
@@ -935,7 +1158,7 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
           </p>
         </div>
       </aside>
-      {selected && (<IncidentDialog incident={selected} onClose={() => setSelected(null)} onStatus={setStatus} onAssign={handleAssignResponder} responders={operationalUsers} isCommand={command} />)}
+      {selected && (<IncidentDialog incident={selected} onClose={() => setSelected(null)} onStatus={setStatus} onAssign={handleAssignResponder} onCloseIncident={handleCloseIncident} onResponderDecision={handleResponderDecision} onResponderFieldStep={handleResponderFieldStep} responders={operationalUsers} isCommand={command} viewerRole={role} viewerUid={user?.uid} assignments={myAssignments} assignmentsStatus={assignmentsStatus} actionLoading={actionLoading} />)}
     </div>);
   if (path === "/citizen/reports" || path === "/command/incidents")
     return (<section>
@@ -959,10 +1182,13 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
             <span className="sr-only">Filter reports by status</span>
             <select value={filter} onChange={(e) => setFilter(e.target.value)} className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm sm:w-48">
               <option>All</option>
-              <option>Acknowledged</option>
-              <option>In progress</option>
               <option>Waiting for connection</option>
+              <option>Acknowledged</option>
+              <option>En route</option>
+              <option>On scene</option>
+              <option>In progress</option>
               <option>Resolved</option>
+              <option>Closed</option>
               <option>Saved on device</option>
             </select>
           </label>
@@ -971,7 +1197,7 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
       <div className="mt-2">
         {visibleIncidents.length ? (visibleIncidents.map((incident) => (<IncidentRow key={incident.id} incident={incident} onOpen={setSelected} />))) : (<p className="py-10 text-center text-sm text-muted-foreground">No matching reports found.</p>)}
       </div>
-      {selected && (<IncidentDialog incident={selected} onClose={() => setSelected(null)} onStatus={setStatus} onAssign={handleAssignResponder} responders={operationalUsers} isCommand={command} />)}
+      {selected && (<IncidentDialog incident={selected} onClose={() => setSelected(null)} onStatus={setStatus} onAssign={handleAssignResponder} onCloseIncident={handleCloseIncident} onResponderDecision={handleResponderDecision} onResponderFieldStep={handleResponderFieldStep} responders={operationalUsers} isCommand={command} viewerRole={role} viewerUid={user?.uid} assignments={myAssignments} assignmentsStatus={assignmentsStatus} actionLoading={actionLoading} />)}
     </section>);
   if (path.includes("safe-zones") || path.endsWith("/map") || path.endsWith("field-map"))
     return (<div className="grid gap-7 xl:grid-cols-[minmax(0,1fr)_340px]">
@@ -1109,9 +1335,19 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
         </p>)}
       </form>
     </div>);
-  if (path.endsWith("/status"))
+  if (path.endsWith("/status")) {
+    const activeAssigned = (rawIncidents || []).find(
+      (i) => user?.uid && i.assignedResponderId === user.uid && !["Resolved", "Closed", "Cancelled"].includes(i.status)
+    );
+    const activeOffer = activeAssigned
+      ? myAssignments.find((a) => a.incidentId === activeAssigned.id && a.status === "ACTIVE")
+      : null;
+    const isOfferPending = activeOffer && (!activeOffer.acceptanceStatus || activeOffer.acceptanceStatus === "OFFERED");
+    const steps = ["En route", "On scene", "In progress", "Resolved"];
+    const currentIdx = activeAssigned ? RESPONDER_FIELD_SEQUENCE.indexOf(activeAssigned.status) : -1;
+
     return (<div className="grid gap-8 xl:grid-cols-[minmax(0,1fr)_300px]">
-      <section>
+      <section className="space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-5">
           <div>
             <p className="text-sm text-muted-foreground">Availability</p>
@@ -1119,169 +1355,406 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
               {available ? "Available for assignments" : "Unavailable"}
             </h2>
           </div>
-          <Button variant={available ? "outline" : "default"} onClick={toggleAvailability}>
-            {available ? "Set unavailable" : "Set available"}
+          <Button variant={available ? "outline" : "default"} onClick={toggleAvailability} disabled={Boolean(activeAssigned) || availabilitySaving}>
+            {availabilitySaving ? "Updating..." : available ? "Set unavailable" : "Set available"}
           </Button>
         </div>
-        {[
-          "Travelling to incident",
-          "Arrived at scene",
-          "Assistance in progress",
-          "Resolved / completed",
-        ].map((status, i) => (<button key={status} onClick={() => setMessage(`Status set to “${status}”.`)} className="flex w-full items-center gap-4 border-b border-border py-5 text-left">
-          <span className={`flex h-8 w-8 items-center justify-center rounded-full ${i === 0 ? "bg-signal/15 text-signal" : "bg-muted text-muted-foreground"}`}>
-            {i + 1}
-          </span>
-          <span className="text-sm font-semibold">{status}</span>
-          <ArrowRight className="ml-auto h-4 w-4 text-muted-foreground" />
-        </button>))}
-        <Textarea placeholder="Add an operation note…" className="mt-5" />
-        <Button className="mt-3" onClick={() => setMessage("Field note added to operation timeline.")}>
-          Add field note
-        </Button>
-        <p role="status" className="mt-3 text-sm text-safe">
-          {message}
-        </p>
+
+        {activeAssigned ? (
+          <div className="space-y-4">
+            <div className="rounded-lg border border-border bg-muted/30 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-mono text-xs font-semibold text-signal">{activeAssigned.id}</span>
+                <Pill tone="signal">{activeAssigned.status}</Pill>
+              </div>
+              <p className="mt-1 text-sm font-semibold">{activeAssigned.category || activeAssigned.type} · {activeAssigned.place}</p>
+              {activeAssigned.description && (
+                <p className="mt-1 text-xs text-muted-foreground">{activeAssigned.description}</p>
+              )}
+            </div>
+
+            {isOfferPending ? (
+              <div className="rounded-lg border border-signal/40 bg-signal/5 p-4 space-y-3">
+                <p className="text-sm font-semibold">New Dispatch Offer — Response Required</p>
+                <p className="text-xs text-muted-foreground">
+                  Accept to lock this assignment and unlock field status progression, or decline so Command can reassign immediately.
+                </p>
+                <Input
+                  value={declineReason}
+                  onChange={(e) => setDeclineReason(e.target.value)}
+                  placeholder="Optional decline reason (e.g. Equipment unavailable / En route elsewhere)"
+                  className="text-xs"
+                />
+                <div className="flex flex-wrap gap-2">
+                  <Button disabled={actionLoading} onClick={() => handleResponderDecision(activeAssigned.id, "ACCEPTED")}>
+                    Accept Assignment
+                  </Button>
+                  <Button variant="outline" disabled={actionLoading} onClick={() => handleResponderDecision(activeAssigned.id, "DECLINED", declineReason)}>
+                    Decline Assignment
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div>
+                {steps.map((stepStatus, i) => {
+                  const stepIdx = RESPONDER_FIELD_SEQUENCE.indexOf(stepStatus);
+                  const isDone = currentIdx >= stepIdx;
+                  const isNext = currentIdx === stepIdx - 1;
+                  return (
+                    <button
+                      key={stepStatus}
+                      type="button"
+                      disabled={actionLoading || !isNext}
+                      onClick={() => handleResponderFieldStep(activeAssigned.id, stepStatus, fieldNote)}
+                      className="flex w-full items-center gap-4 border-b border-border py-4 text-left disabled:opacity-50 hover:bg-muted/30"
+                    >
+                      <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full ${isDone ? "bg-safe/20 text-safe" : isNext ? "bg-signal/15 text-signal" : "bg-muted text-muted-foreground"}`}>
+                        {i + 1}
+                      </span>
+                      <span className="text-sm font-semibold">
+                        {stepStatus === "Resolved" ? "Resolved / completed" : stepStatus}
+                      </span>
+                      <span className="ml-auto text-xs text-muted-foreground">
+                        {isDone ? "Completed" : isNext ? "Next step" : "Locked"}
+                      </span>
+                    </button>
+                  );
+                })}
+                <Textarea
+                  value={fieldNote}
+                  onChange={(e) => setFieldNote(e.target.value)}
+                  placeholder="Add an operation / resolution note (included with your next status update)…"
+                  className="mt-5"
+                />
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="rounded-lg border border-border bg-muted/20 p-6 text-sm text-muted-foreground">
+            No active dispatch assignment. When Command dispatches an incident to you, it will appear here for acceptance and field updates.
+          </div>
+        )}
+
+        {availabilityError && (
+          <p role="alert" className="mt-3 text-sm text-urgent">
+            {availabilityError}
+          </p>
+        )}
+        {message && (
+          <p role="status" className="mt-3 text-sm text-safe">
+            {message}
+          </p>
+        )}
       </section>
       <div className="border-l border-border pl-5">
-        <p className="section-kicker">STATUS HISTORY</p>
-        <p className="mt-4 text-sm">{available ? "Available" : "Unavailable"} · Updated</p>
+        <p className="section-kicker">DUTY STATUS</p>
+        <p className="mt-4 text-sm font-medium">
+          {available
+            ? "AVAILABLE (On duty · Free for dispatch)"
+            : profile?.dutyStatus === "DISPATCHED" || profile?.dutyStatus === "ON_SCENE"
+              ? `${profile.dutyStatus} (Locked to active incident)`
+              : profile?.dutyStatus === "OFF_DUTY"
+                ? "OFF_DUTY (Not dispatchable)"
+                : "UNAVAILABLE (Not accepting dispatch)"}
+        </p>
+        {profile?.dutyStatus && (
+          <p className="mt-1 font-mono text-xs text-muted-foreground">Persisted state: {profile.dutyStatus}</p>
+        )}
         <p className="mt-2 text-xs text-muted-foreground">Operation activity · Vijayawada Sector</p>
       </div>
     </div>);
-  if (path.endsWith("/simulation"))
-    return (<div className="space-y-7">
+  }
+  if (path.endsWith("/simulation")) {
+    const latestMsg = simState.messages[0] || null;
+    const holderSet = new Set(
+      simState.messages
+        .filter((m) => m.status !== "Delivered" && m.status !== "Expired")
+        .map((m) => m.currentHolderId)
+    );
+    const getNodeIcon = (type) => {
+      if (type === "CITIZEN")
+        return LifeBuoy;
+      if (type === "DATA_MULE")
+        return Compass;
+      if (type === "GATEWAY")
+        return Radio;
+      return Network;
+    };
+    return (<div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <Pill tone="signal">
-          <Network /> SIMULATION
-        </Pill>
-        <div className="flex flex-wrap gap-2">
-          <select aria-label="Choose simulation scenario" value={activeScenario} onChange={(e) => {
-            setActiveScenario(e.target.value);
-            setPlaying(false);
-          }} className="h-9 rounded-md border border-input bg-background px-3 text-sm">
-            {[
-              "Normal connectivity",
-              "Internet unavailable",
-              "Dense network",
-              "Network partition",
-              "Data Mule",
-              "Duplicate messages",
-            ].map((s) => (<option key={s}>{s}</option>))}
+        <div className="flex flex-wrap items-center gap-2">
+          <Pill tone="signal">
+            <Network /> SIMULATION DATA
+          </Pill>
+          <span className="font-mono text-xs text-muted-foreground">
+            Tick {simState.tick} · {simState.messages.length} message(s)
+          </span>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <select
+            aria-label="Choose simulation scenario"
+            value={simState.scenario}
+            onChange={(e) => initializeSimulation(e.target.value)}
+            className="h-9 rounded-md border border-input bg-background px-3 text-sm"
+          >
+            {SIMULATION_SCENARIOS.map((s) => (<option key={s} value={s}>{s}</option>))}
           </select>
-          <Button variant="outline" onClick={() => setPlaying(!playing)}>
-            {playing ? "Pause" : "Play"}
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => (simState.isPlaying ? pauseSimulation() : startSimulation())}
+          >
+            {simState.isPlaying ? "Pause" : "Play"}
           </Button>
-          <Button variant="outline" onClick={() => setMessage("Simulation advanced one step.")}>
+          <Button type="button" variant="outline" onClick={() => stepSimulation()}>
             Step
           </Button>
-          <Button variant="ghost" onClick={() => {
-            setPlaying(false);
-            setMessage("Simulation reset.");
-          }}>
+          <Button type="button" variant="ghost" onClick={() => resetSimulation()}>
             Reset
           </Button>
         </div>
       </div>
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_260px]">
-        <div className="simulation-board relative min-h-[420px] overflow-hidden border border-border">
+      <div className={`grid gap-6 ${isMobile ? "grid-cols-1" : "xl:grid-cols-[minmax(0,1fr)_300px]"}`}>
+        <div className="simulation-board relative min-h-[380px] overflow-hidden border border-border sm:min-h-[420px]">
           <div className="absolute inset-0 simulation-grid" />
-          {[
-            { x: "15%", y: "27%", t: "Citizen", i: LifeBuoy },
-            { x: "38%", y: "54%", t: "Relay", i: Network },
-            { x: "62%", y: "25%", t: "Data mule", i: Compass },
-            { x: "81%", y: "61%", t: "Gateway", i: Radio },
-            { x: "27%", y: "78%", t: "Relay", i: Network },
-          ].map(({ x, y, t, i: Icon }) => (<div key={`${x}${y}`} className={`node ${playing ? "node-active" : ""}`} style={{ left: x, top: y }}>
-            <span className="node-dot">
-              <Icon />
-            </span>
-            <span className="node-label">{t}</span>
-          </div>))}
           <svg className="absolute inset-0 h-full w-full" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
-            <path d="M 15 27 L 38 54 L 62 25 L 81 61 M 15 27 L 27 78 L 38 54" className="network-line" />
+            {simState.links.map((link) => {
+              const fromNode = simState.nodes.find((n) => n.id === link.from);
+              const toNode = simState.nodes.find((n) => n.id === link.to);
+              if (!fromNode || !toNode)
+                return null;
+              const isTransmitting = simState.activeTransmissions.some(
+                (t) => (t.from === link.from && t.to === link.to) || (t.from === link.to && t.to === link.from)
+              );
+              return (
+                <line
+                  key={`${link.from}-${link.to}`}
+                  x1={fromNode.position.x}
+                  y1={fromNode.position.y}
+                  x2={toNode.position.x}
+                  y2={toNode.position.y}
+                  className={isTransmitting ? "stroke-signal stroke-[0.9]" : "network-line"}
+                  strokeDasharray={isTransmitting ? "2 1" : undefined}
+                />
+              );
+            })}
           </svg>
+          {simState.nodes.map((node) => {
+            const Icon = getNodeIcon(node.type);
+            const isCarrying = holderSet.has(node.id);
+            const isTransmitting = simState.activeTransmissions.some(
+              (t) => t.from === node.id || t.to === node.id
+            );
+            return (
+              <div
+                key={node.id}
+                data-testid={`sim-node-${node.id}`}
+                className={`node transition-all duration-300 ${node.available ? (isCarrying || isTransmitting ? "node-active" : "") : "opacity-40"}`}
+                style={{ left: `${node.position.x}%`, top: `${node.position.y}%` }}
+              >
+                <span className={`node-dot relative ${isCarrying ? "ring-2 ring-signal ring-offset-2" : ""}`}>
+                  <Icon />
+                  {node.buffer.length > 0 && (
+                    <span className="absolute -right-2 -top-2 flex h-4 min-w-4 items-center justify-center rounded-full bg-signal px-1 text-[10px] font-bold text-white">
+                      {node.buffer.length}
+                    </span>
+                  )}
+                </span>
+                <span className="node-label">
+                  {node.id} · {node.label}{!node.available ? " (Offline)" : ""}
+                </span>
+              </div>
+            );
+          })}
           <span className="absolute bottom-3 left-3 rounded bg-background/90 px-2 py-1 text-xs text-muted-foreground">
-            Scenario: {activeScenario}
+            Scenario: {simState.scenario} · Tick {simState.tick}
           </span>
         </div>
-        <aside>
-          <p className="section-kicker">NODE TYPES</p>
-          <div className="mt-2 space-y-1">
-            {["Citizen node", "Relay node", "Data mule node", "Gateway node"].map((t) => (<p key={t} className="border-b border-border py-3 text-sm">
-              {t}
-            </p>))}
+        <aside className="space-y-5">
+          <div>
+            <p className="section-kicker">NODES & BUFFERS</p>
+            <div className="mt-2 divide-y divide-border">
+              {simState.nodes.map((n) => (
+                <div key={n.id} className="flex items-center justify-between gap-2 py-2 text-xs">
+                  <span className="font-medium text-foreground">
+                    {n.id} · {n.label}
+                  </span>
+                  <span className="font-mono text-muted-foreground">
+                    {n.available ? `Online (${n.buffer.length})` : "Offline"}
+                  </span>
+                </div>
+              ))}
+            </div>
           </div>
-          <div className="mt-6">
-            <p className="section-kicker">EVENT LOG</p>
-            <p className="mt-3 text-sm">{message || "Awaiting simulation events…"}</p>
-            <p className="mt-3 font-mono text-xs text-muted-foreground">
-              MSG-SIM-014 · 2 hops · TTL 18
-            </p>
+          <div>
+            <p className="section-kicker">ACTIVE MESSAGE & EVENT LOG</p>
+            {latestMsg ? (
+              <p className="mt-2 font-mono text-xs text-signal">
+                {latestMsg.id} · {latestMsg.status} · {latestMsg.hopCount} hop(s) · TTL {latestMsg.ttl} · Holder: {latestMsg.currentHolderId}
+              </p>
+            ) : (
+              <p className="mt-2 text-xs text-muted-foreground">
+                No simulation messages injected yet.
+              </p>
+            )}
+            <div className="mt-3 max-h-40 space-y-1.5 overflow-y-auto rounded border border-border bg-muted/20 p-2.5 text-xs">
+              {simState.events.length === 0 ? (
+                <p className="text-muted-foreground">Awaiting simulation events…</p>
+              ) : (
+                simState.events.slice(0, 12).map((ev) => (
+                  <div key={ev.id} className="border-b border-border/60 pb-1 last:border-b-0">
+                    <span className="font-mono text-[10px] text-signal">[T{ev.tick}] {ev.eventType}</span>
+                    <p className="text-foreground">{ev.description}</p>
+                  </div>
+                ))
+              )}
+            </div>
           </div>
-          <Button className="mt-5 w-full" onClick={() => setMessage("Simulation message injected: MSG-SIM-015.")}>
-            Inject simulation message
-          </Button>
-          <p className="mt-3 text-xs leading-5 text-muted-foreground">
-            Educational visual demo only. No Bluetooth, radio, satellite, or drone connection is
-            implemented.
+          <div className="space-y-2">
+            <label className="block text-xs text-muted-foreground">
+              Message TTL (ticks)
+              <Input
+                type="number"
+                min={1}
+                max={30}
+                value={simTtl}
+                onChange={(e) => setSimTtl(Math.max(1, Number(e.target.value) || 12))}
+                className="mt-1 h-8 text-xs"
+              />
+            </label>
+            <Button
+              type="button"
+              className="w-full"
+              onClick={() => injectSimulationMessage({ sourceNodeId: "CIT-01", ttl: simTtl })}
+            >
+              Inject simulation message
+            </Button>
+          </div>
+          <p className="text-xs leading-5 text-muted-foreground">
+            Educational simulation only. Never creates real Citizen SOS incidents or dispatches responders.
           </p>
         </aside>
       </div>
     </div>);
-  if (path.endsWith("/messages"))
-    return (<section>
+  }
+  if (path.endsWith("/messages")) {
+    const filteredMessages = simState.messages.filter((m) => {
+      const matchesStatus = filter === "All" || m.status === filter;
+      const q = simSearch.trim().toLowerCase();
+      const matchesSearch = !q ||
+        m.id.toLowerCase().includes(q) ||
+        m.sourceNodeId.toLowerCase().includes(q) ||
+        m.currentHolderId.toLowerCase().includes(q) ||
+        m.routeHistory.some((r) => r.toLowerCase().includes(q));
+      return matchesStatus && matchesSearch;
+    });
+    const selectedSimMsg = simState.messages.find((m) => m.id === selectedSimMsgId) || filteredMessages[0] || null;
+    const selectedMsgEvents = selectedSimMsg
+      ? simState.events.filter((ev) => ev.messageId === selectedSimMsg.id)
+      : [];
+    return (<section className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-5">
         <div>
           <Pill tone="signal">
-            <Network /> SIMULATION
+            <Network /> SIMULATION DATA
           </Pill>
           <h2 className="mt-3 font-display text-2xl font-semibold">Simulated message activity</h2>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Live DTN event stream from Simulation Laboratory · Scenario: {simState.scenario} · Tick {simState.tick}
+          </p>
         </div>
-        <label>
-          <span className="sr-only">Filter messages</span>
-          <select value={filter} onChange={(e) => setFilter(e.target.value)} className="h-9 rounded-md border border-input bg-background px-3 text-sm">
-            <option>All</option>
-            <option>Delivered</option>
-            <option>Forwarded</option>
-            <option>Expired</option>
-          </select>
-        </label>
+        <div className="flex flex-wrap items-center gap-2">
+          <Input
+            type="search"
+            aria-label="Search simulation messages"
+            placeholder="Search ID or node..."
+            value={simSearch}
+            onChange={(e) => setSimSearch(e.target.value)}
+            className="h-9 w-44 text-sm sm:w-52"
+          />
+          <label>
+            <span className="sr-only">Filter messages</span>
+            <select value={filter} onChange={(e) => setFilter(e.target.value)} className="h-9 rounded-md border border-input bg-background px-3 text-sm">
+              <option value="All">All</option>
+              <option value="Created">Created</option>
+              <option value="Forwarded">Forwarded</option>
+              <option value="Carried">Carried</option>
+              <option value="Delivered">Delivered</option>
+              <option value="Expired">Expired</option>
+            </select>
+          </label>
+        </div>
       </div>
-      <div className="mt-3">
-        {[
-          {
-            id: "MSG-SIM-014",
-            from: "CIT-04",
-            to: "Gateway A",
-            state: "Delivered",
-            hops: "2 hops",
-          },
-          {
-            id: "MSG-SIM-012",
-            from: "CIT-02",
-            to: "Relay 03",
-            state: "Forwarded",
-            hops: "1 hop",
-          },
-          { id: "MSG-SIM-009", from: "CIT-01", to: "Expired", state: "Expired", hops: "5 hops" },
-        ]
-          .filter((m) => filter === "All" || m.state === filter)
-          .map((m) => (<div key={m.id} className="grid grid-cols-2 gap-2 border-b border-border py-4 sm:grid-cols-[1.2fr_1fr_1fr_auto]">
-            <span className="font-mono text-xs text-signal">{m.id}</span>
-            <span className="text-sm">
-              {m.from} → {m.to}
-            </span>
-            <span className="text-sm text-muted-foreground">{m.hops}</span>
-            <Pill tone={m.state === "Delivered" ? "good" : "neutral"}>
-              SIMULATION · {m.state}
-            </Pill>
-          </div>))}
-      </div>
-      <p className="mt-5 text-xs text-muted-foreground">
-        Simulation messages and gateway deliveries are separate from citizen incident records.
+
+      {filteredMessages.length === 0 ? (
+        <div className="rounded-lg border border-border bg-muted/20 p-6 text-center text-sm text-muted-foreground">
+          No simulation messages match the current filter. Inject a simulation message in Simulation Laboratory to trace its DTN hops and events.
+        </div>
+      ) : (
+        <div className={`grid gap-6 ${isMobile ? "grid-cols-1" : "lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]"}`}>
+          <div className="divide-y divide-border rounded-lg border border-border">
+            {filteredMessages.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                onClick={() => setSelectedSimMsgId(m.id)}
+                className={`grid w-full grid-cols-1 gap-2 px-4 py-3.5 text-left transition-colors hover:bg-muted/40 sm:grid-cols-[1.1fr_1.2fr_auto_auto] sm:items-center ${
+                  selectedSimMsg?.id === m.id ? "bg-signal/5 border-l-2 border-l-signal" : ""
+                }`}
+              >
+                <span className="font-mono text-xs font-semibold text-signal">{m.id}</span>
+                <span className="text-xs text-foreground">
+                  {m.sourceNodeId} → {m.currentHolderId} (dest {m.destinationNodeId})
+                </span>
+                <span className="font-mono text-xs text-muted-foreground">
+                  {m.hopCount} hop(s) · TTL {m.ttl}
+                </span>
+                <Pill tone={m.status === "Delivered" ? "good" : m.status === "Expired" ? "warn" : "neutral"}>
+                  SIMULATION · {m.status}
+                </Pill>
+              </button>
+            ))}
+          </div>
+
+          {selectedSimMsg && (
+            <div className="space-y-4 rounded-lg border border-border bg-card p-4">
+              <div>
+                <p className="section-kicker">ROUTE HISTORY · {selectedSimMsg.id}</p>
+                <p className="mt-2 font-mono text-xs text-foreground">
+                  {selectedSimMsg.routeHistory.join(" → ")}
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Status: {selectedSimMsg.status} · Hops: {selectedSimMsg.hopCount} · Remaining TTL: {selectedSimMsg.ttl}
+                </p>
+              </div>
+              <div>
+                <p className="section-kicker">MESSAGE EVENT TRACE</p>
+                <div className="mt-2 max-h-60 space-y-2 overflow-y-auto">
+                  {selectedMsgEvents.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">No events recorded for this message.</p>
+                  ) : (
+                    selectedMsgEvents.map((ev) => (
+                      <div key={ev.id} className="rounded border border-border/70 bg-background p-2 text-xs">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-mono text-[11px] font-semibold text-signal">{ev.eventType}</span>
+                          <span className="font-mono text-[10px] text-muted-foreground">{ev.id} · {ev.timestamp}</span>
+                        </div>
+                        <p className="mt-1 text-foreground">{ev.description}</p>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      <p className="text-xs text-muted-foreground">
+        Simulation messages and gateway deliveries are strictly isolated from real Citizen SOS incident records.
       </p>
     </section>);
+  }
   if (path.endsWith("/users"))
     return (<section className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-5">
@@ -1309,13 +1782,13 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
       </div>
 
       {/* Tab Controls */}
-      <div className="flex border-b border-border" role="tablist">
+      <div className="flex flex-wrap gap-1 border-b border-border" role="tablist">
         <button
           type="button"
           role="tab"
           aria-selected={usersTab === "directory"}
           onClick={() => setUsersTab("directory")}
-          className={`flex items-center gap-2 border-b-2 px-4 py-2.5 text-sm font-medium transition-colors ${usersTab === "directory"
+          className={`flex items-center gap-2 border-b-2 px-3 py-2.5 text-sm font-medium transition-colors sm:px-4 ${usersTab === "directory"
               ? "border-primary text-primary font-semibold"
               : "border-transparent text-muted-foreground hover:text-foreground"
             }`}
@@ -1331,7 +1804,7 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
           role="tab"
           aria-selected={usersTab === "applications"}
           onClick={() => setUsersTab("applications")}
-          className={`flex items-center gap-2 border-b-2 px-4 py-2.5 text-sm font-medium transition-colors ${usersTab === "applications"
+          className={`flex items-center gap-2 border-b-2 px-3 py-2.5 text-sm font-medium transition-colors sm:px-4 ${usersTab === "applications"
               ? "border-primary text-primary font-semibold"
               : "border-transparent text-muted-foreground hover:text-foreground"
             }`}
@@ -1346,6 +1819,21 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
             <span className="ml-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">0</span>
           )}
         </button>
+        {role === "ADMINISTRATOR" && (
+          <button
+            type="button"
+            role="tab"
+            aria-selected={usersTab === "provision"}
+            onClick={() => setUsersTab("provision")}
+            className={`flex items-center gap-2 border-b-2 px-3 py-2.5 text-sm font-medium transition-colors sm:px-4 ${usersTab === "provision"
+                ? "border-primary text-primary font-semibold"
+                : "border-transparent text-muted-foreground hover:text-foreground"
+              }`}
+          >
+            <Shield className="h-4 w-4" />
+            Add Personnel
+          </button>
+        )}
       </div>
 
       {/* Feedback Alert */}
@@ -1379,42 +1867,29 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
       {usersTab === "directory" && (
         <div>
           <div className="mt-4 space-y-0">
-            {(operationalUsers.length > 0
-              ? operationalUsers
-              : [
-                {
-                  uid: "u-1",
-                  displayName: "Citizen User",
-                  role: "CITIZEN",
-                  status: "ACTIVE",
-                },
-                {
-                  uid: "u-2",
-                  displayName: "NTR District First Responder",
-                  role: "RESPONDER",
-                  responderSubtype: "PROFESSIONAL",
-                  status: "ACTIVE",
-                },
-                {
-                  uid: "u-3",
-                  displayName: "AP Volunteer Rescue",
-                  role: "RESPONDER",
-                  responderSubtype: "VOLUNTEER",
-                  status: "ACTIVE",
-                },
-                {
-                  uid: "u-4",
-                  displayName: "VMC Incident Coordinator",
-                  role: "COORDINATOR",
-                  status: "ACTIVE",
-                },
-                {
-                  uid: "u-5",
-                  displayName: "State Disaster Admin",
-                  role: "ADMINISTRATOR",
-                  status: "ACTIVE",
-                },
-              ]).map((u) => (
+            {(() => {
+              const previewDirectory = [
+                { uid: "u-1", displayName: "Citizen User", role: "Citizen", rawRole: "CITIZEN", status: "Active" },
+                { uid: "u-2", displayName: "NTR District First Responder", role: "Professional responder", rawRole: "RESPONDER", responderSubtype: "PROFESSIONAL", status: "Active" },
+                { uid: "u-3", displayName: "AP Volunteer Rescue", role: "Volunteer responder", rawRole: "RESPONDER", responderSubtype: "VOLUNTEER", status: "Active" },
+                { uid: "u-4", displayName: "VMC Incident Coordinator", role: "Coordinator", rawRole: "COMMAND", status: "Active" },
+                { uid: "u-5", displayName: "State Disaster Admin", role: "Administrator", rawRole: "COMMAND", status: "Active" },
+              ];
+              const directoryRows = user
+                ? operationalUsers
+                : role === "COORDINATOR"
+                  ? previewDirectory.filter((item) => item.rawRole === "RESPONDER")
+                  : previewDirectory;
+              if (directoryRows.length === 0) {
+                return (
+                  <div className="rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
+                    {role === "COORDINATOR"
+                      ? "No active responders found in your directory."
+                      : "No personnel records found."}
+                  </div>
+                );
+              }
+              return directoryRows.map((u) => (
                 <div
                   key={u.uid}
                   className="grid grid-cols-[1fr_auto] gap-3 border-b border-border py-4 sm:grid-cols-[1.2fr_1fr_auto_auto]"
@@ -1429,12 +1904,29 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
                       <Pill tone="neutral" className="text-[0.6rem]">{u.responderSubtype}</Pill>
                     )}
                   </div>
-                  <Pill tone={u.status === "ACTIVE" ? "good" : "warn"}>{u.status}</Pill>
+                  <Pill tone={u.status === "ACTIVE" || u.status === "Active" ? "good" : "warn"}>{u.status}</Pill>
                   {role === "ADMINISTRATOR" ? (
                     <Button
                       size="sm"
                       variant="outline"
-                      onClick={() => setMessage(`${u.displayName} account controls opened.`)}
+                      onClick={async () => {
+                        setManagedUser(u);
+                        setManageActionMode(null);
+                        setSuspendReason("");
+                        setManageAuditLogs([]);
+                        setManageApprovalRecord(null);
+                        setManageLoadingAudit(true);
+                        try {
+                          const [logs, rev] = await Promise.all([
+                            fetchAccountAuditHistory(u.uid, u.invitationId).catch(() => []),
+                            u.lastReviewId ? fetchReviewById(u.lastReviewId).catch(() => null) : Promise.resolve(null),
+                          ]);
+                          setManageAuditLogs(logs || []);
+                          setManageApprovalRecord(rev || null);
+                        } finally {
+                          setManageLoadingAudit(false);
+                        }
+                      }}
                     >
                       Manage
                     </Button>
@@ -1442,10 +1934,13 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
                     <span className="hidden text-xs text-muted-foreground sm:block">Read-only</span>
                   )}
                 </div>
-              ))}
+              ));
+            })()}
           </div>
           <p className="mt-4 text-xs text-muted-foreground">
-            Coordinator view is read-only. Administrator has authorization to manage roles and assignments.
+            {role === "COORDINATOR"
+              ? "Coordinator directory is read-only and scoped to Responder accounts only."
+              : "Coordinator view is read-only. Administrator has authorization to manage roles and assignments."}
           </p>
         </div>
       )}
@@ -1562,6 +2057,313 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
               ))}
             </div>
           )}
+
+          {/* Immutable Vetting Audit Trail */}
+          {recentReviews.length > 0 && (
+            <div className="pt-4 border-t border-border space-y-3">
+              <h3 className="font-display text-base font-semibold text-foreground">
+                Recent Vetting Decisions (Audit Trail)
+              </h3>
+              <div className="space-y-2.5">
+                {recentReviews.map((rev) => {
+                  const decisionLabel = rev.decision === "REJECTED" ? "Rejected" : "Approved";
+                  const reviewerLevelLabel =
+                    rev.reviewerDesignation ||
+                    (rev.reviewerCommandLevel === "ADMINISTRATOR" || rev.reviewerRole === "ADMINISTRATOR"
+                      ? "Command Administrator"
+                      : "Command Operations / Coordinator");
+                  const formattedDate = rev.reviewedAtIso
+                    ? new Intl.DateTimeFormat("en-GB", {
+                        day: "2-digit",
+                        month: "short",
+                        year: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                        hour12: true,
+                      }).format(new Date(rev.reviewedAtIso))
+                    : "Just now";
+                  return (
+                    <div
+                      key={rev.id}
+                      className="flex flex-wrap items-start justify-between gap-2 rounded-lg border border-border bg-card/60 p-3.5 text-xs"
+                    >
+                      <div className="space-y-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Pill tone={rev.decision === "REJECTED" ? "warn" : "good"}>{rev.decision}</Pill>
+                          <span className="font-semibold text-foreground">
+                            {rev.applicantName || rev.applicantUid}
+                          </span>
+                          {rev.assignedSubtype && (
+                            <Pill tone="neutral">{rev.assignedSubtype}</Pill>
+                          )}
+                        </div>
+                        <p className="text-foreground font-medium">
+                          {decisionLabel} by {rev.reviewerName || rev.reviewerUid}
+                        </p>
+                        <p className="text-muted-foreground">
+                          {reviewerLevelLabel} · {formattedDate}
+                        </p>
+                        {rev.rejectionReason && (
+                          <p className="text-urgent">Reason: {rev.rejectionReason}</p>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Add Personnel Tab Content (Administrator Only) */}
+      {usersTab === "provision" && role === "ADMINISTRATOR" && (
+        <div className="space-y-6">
+          <div className="rounded-lg border border-border bg-card p-5 shadow-sm space-y-5">
+            <div>
+              <h3 className="font-display text-lg font-semibold text-foreground">
+                Provision Authorized Personnel
+              </h3>
+              <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
+                Select an authorized personnel category and issue a single-use invitation link. Personal and professional
+                persona details are completed by the invitee after verifying their email.
+              </p>
+            </div>
+
+            {/* 3 Visual Role-Selection Cards */}
+            <fieldset className="space-y-2">
+              <legend className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Select Personnel Role
+              </legend>
+              <div className="grid gap-3 sm:grid-cols-3">
+                {[
+                  {
+                    key: "COMMAND:COORDINATOR",
+                    title: "Command Operations",
+                    subtitle: "Coordinator / Operations",
+                    description: "Authorized personnel responsible for coordination and incident operations.",
+                    icon: Radio,
+                  },
+                  {
+                    key: "RESPONDER:PROFESSIONAL",
+                    title: "Responder",
+                    subtitle: "Professional",
+                    description: "Agency-affiliated or professional emergency response personnel.",
+                    icon: Shield,
+                  },
+                  {
+                    key: "RESPONDER:VOLUNTEER",
+                    title: "Responder",
+                    subtitle: "Volunteer",
+                    description: "Community or voluntary emergency response personnel.",
+                    icon: LifeBuoy,
+                  },
+                ].map(({ key, title, subtitle, description, icon: Icon }) => {
+                  const isSelected = provTrack === key;
+                  return (
+                    <button
+                      key={key}
+                      type="button"
+                      aria-pressed={isSelected}
+                      disabled={provSubmitting}
+                      onClick={() => {
+                        setProvTrack(key);
+                        setProvUnit("GENERAL");
+                        setProvResult(null);
+                        setReviewFeedback(null);
+                      }}
+                      className={`flex min-h-[104px] flex-col items-start justify-between rounded-lg border p-3.5 text-left transition-all cursor-pointer ${
+                        isSelected
+                          ? "border-signal bg-signal/10 ring-1 ring-signal/40 shadow-sm"
+                          : "border-border bg-background hover:bg-muted/60"
+                      }`}
+                    >
+                      <div className="flex w-full items-center justify-between gap-2">
+                        <span className="inline-flex items-center gap-1.5 text-sm font-semibold text-foreground">
+                          <Icon className="h-4 w-4 text-signal shrink-0" />
+                          {title}
+                        </span>
+                        <Pill tone={isSelected ? "signal" : "neutral"} className="text-[0.6rem]">
+                          {subtitle}
+                        </Pill>
+                      </div>
+                      <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                        {description}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+            </fieldset>
+
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                setReviewFeedback(null);
+                setProvResult(null);
+                setProvCopied(false);
+                setProvSubmitting(true);
+                try {
+                  const [tRole, tSub] = provTrack.split(":");
+                  const res = await createPersonnelInvitation({
+                    fullName: provName,
+                    email: provEmail,
+                    targetRole: tRole,
+                    targetCommandLevel: tRole === "COMMAND" ? tSub : null,
+                    targetResponderSubtype: tRole === "RESPONDER" ? tSub : null,
+                    targetUnit: tRole === "RESPONDER" ? provUnit : null,
+                  });
+                  setProvResult(res);
+                  setProvName("");
+                  setProvEmail("");
+                  setProvUnit("GENERAL");
+                  setReviewFeedback({
+                    type: "success",
+                    text: `Provisioning invitation created for ${res.fullName}.`,
+                  });
+                  await refreshUsersAndApplications();
+                } catch (err) {
+                  setReviewFeedback({
+                    type: "error",
+                    text: err?.message || "Failed to create personnel invitation.",
+                  });
+                } finally {
+                  setProvSubmitting(false);
+                }
+              }}
+              className="grid gap-4 sm:grid-cols-2"
+            >
+              <div>
+                <label className="block text-xs font-semibold text-foreground">
+                  Full name
+                  <Input
+                    required
+                    placeholder="e.g., Priya Sharma"
+                    value={provName}
+                    onChange={(e) => setProvName(e.target.value)}
+                    disabled={provSubmitting}
+                    className="mt-1.5"
+                  />
+                </label>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-foreground">
+                  Email address
+                  <Input
+                    required
+                    type="email"
+                    placeholder="personnel@agency.org"
+                    value={provEmail}
+                    onChange={(e) => setProvEmail(e.target.value)}
+                    disabled={provSubmitting}
+                    className="mt-1.5"
+                  />
+                </label>
+              </div>
+
+              {provTrack.startsWith("RESPONDER:") && (
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-semibold text-foreground">
+                    Operational Unit (Required)
+                    <select
+                      required
+                      value={provUnit}
+                      onChange={(e) => setProvUnit(e.target.value)}
+                      disabled={provSubmitting}
+                      className="mt-1.5 h-9 w-full rounded-md border border-input bg-background px-3 text-xs"
+                    >
+                      <option value="GENERAL">General</option>
+                      <option value="MEDICAL">Medical</option>
+                      <option value="SEARCH_AND_RESCUE">Search &amp; Rescue</option>
+                      <option value="FIRE_HAZARD">Fire Hazard</option>
+                      <option value="LOGISTICS">Logistics</option>
+                    </select>
+                  </label>
+                </div>
+              )}
+
+              <div className="sm:col-span-2 flex flex-wrap items-center justify-between gap-3 pt-1">
+                <p className="text-[0.7rem] text-muted-foreground">
+                  Spark tier: Share the generated single-use invite link directly with the recipient; they verify their email and complete their persona profile.
+                </p>
+                <Button type="submit" disabled={provSubmitting} className="bg-signal hover:bg-signal/90 text-white">
+                  {provSubmitting ? "Generating Invite..." : "Create Personnel Invitation"}
+                </Button>
+              </div>
+            </form>
+
+            {provResult && (
+              <div className="rounded-md border border-safe/30 bg-safe/10 p-4 space-y-2 text-xs">
+                <p className="font-semibold text-safe">Invitation Ready (Expires in 7 days)</p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <code className="flex-1 break-all rounded bg-background px-2.5 py-1.5 font-mono text-[0.7rem] border border-border">
+                    {provResult.inviteUrl}
+                  </code>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      if (navigator.clipboard) {
+                        void navigator.clipboard.writeText(provResult.inviteUrl);
+                        setProvCopied(true);
+                      }
+                    }}
+                  >
+                    {provCopied ? "Copied" : "Copy Link"}
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {invitations.length > 0 && (
+            <div className="space-y-3">
+              <h4 className="font-display text-base font-semibold text-foreground">
+                Provisioning Invitations ({invitations.length})
+              </h4>
+              <div className="space-y-2">
+                {invitations.map((inv) => (
+                  <div
+                    key={inv.id}
+                    className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-card p-3.5 text-xs"
+                  >
+                    <div className="space-y-0.5">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-semibold text-foreground">{inv.fullName}</span>
+                        <Pill tone={inv.status === "PENDING" ? "warn" : inv.status === "CLAIMED" ? "good" : "neutral"}>
+                          {inv.status}
+                        </Pill>
+                        <Pill tone="neutral">{inv.targetCommandLevel || inv.targetResponderSubtype || inv.targetRole}</Pill>
+                      </div>
+                      <p className="text-muted-foreground">
+                        {inv.email} · {inv.designation} · Invited by {inv.invitedByName}
+                      </p>
+                    </div>
+                    {inv.status === "PENDING" && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={async () => {
+                          try {
+                            await revokePersonnelInvitation(inv.id);
+                            setReviewFeedback({ type: "success", text: `Revoked invitation for ${inv.email}.` });
+                            await refreshUsersAndApplications();
+                          } catch (err) {
+                            setReviewFeedback({ type: "error", text: err?.message || "Failed to revoke invitation." });
+                          }
+                        }}
+                      >
+                        Revoke
+                      </Button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -1674,6 +2476,310 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
           </section>
         </div>
       )}
+
+      {/* Account Management Dialog (Desktop/Tablet) / Bottom Sheet (Mobile) — Administrator Only */}
+      {managedUser && role === "ADMINISTRATOR" && (() => {
+        const isSelf = managedUser.uid === user?.uid;
+        const isTargetAdmin = managedUser.commandLevel === "ADMINISTRATOR";
+        const isTargetSuspended = managedUser.accountStatus === "SUSPENDED" || managedUser.status === "Suspended";
+        const canChangeStatus = !isSelf && !isTargetAdmin;
+        const locationStr = [managedUser.city, managedUser.district, managedUser.region].filter(Boolean).join(", ");
+        const regDateStr = managedUser.createdAtIso
+          ? new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", year: "numeric" }).format(new Date(managedUser.createdAtIso))
+          : "Unavailable";
+
+        const manageBody = (
+          <div className="space-y-5 text-xs">
+            {/* Profile Details */}
+            <div className="rounded-md border border-border bg-muted/20 p-3.5 space-y-2">
+              <p className="font-semibold uppercase tracking-wider text-muted-foreground text-[0.65rem]">
+                Profile &amp; Standing
+              </p>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <div><span className="text-muted-foreground">Full Name:</span> <strong className="text-foreground">{managedUser.displayName}</strong></div>
+                <div><span className="text-muted-foreground">Email:</span> <strong className="text-foreground break-all">{managedUser.email || "—"}</strong></div>
+                <div><span className="text-muted-foreground">Phone:</span> <strong className="text-foreground">{managedUser.phoneNumber || "Not provided"}</strong></div>
+                <div><span className="text-muted-foreground">Location:</span> <strong className="text-foreground">{locationStr || "Not provided"}</strong></div>
+                <div><span className="text-muted-foreground">UID:</span> <code className="font-mono text-[0.68rem] break-all">{managedUser.uid}</code></div>
+                <div><span className="text-muted-foreground">Email Verification:</span> <strong className={managedUser.emailVerified ? "text-safe" : "text-urgent"}>{managedUser.emailVerified ? "Verified" : "Unverified"}</strong></div>
+                <div><span className="text-muted-foreground">Registered:</span> <strong className="text-foreground">{regDateStr}</strong></div>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-muted-foreground">Account Status:</span>
+                  <Pill tone={isTargetSuspended ? "warn" : "good"}>{isTargetSuspended ? "SUSPENDED" : "ACTIVE"}</Pill>
+                </div>
+              </div>
+            </div>
+
+            {/* Authorization Overview */}
+            <div className="rounded-md border border-border bg-muted/20 p-3.5 space-y-2">
+              <p className="font-semibold uppercase tracking-wider text-muted-foreground text-[0.65rem]">
+                Authorization Overview
+              </p>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <div><span className="text-muted-foreground">Role:</span> <strong className="text-foreground">{managedUser.role}</strong></div>
+                <div>
+                  <span className="text-muted-foreground">Capabilities:</span>{" "}
+                  <strong className="text-foreground">
+                    {managedUser.capabilities?.length > 0 ? managedUser.capabilities.join(", ") : "None (Command / Pending)"}
+                  </strong>
+                </div>
+                {managedUser.designation && (
+                  <div className="sm:col-span-2"><span className="text-muted-foreground">Designation:</span> <strong className="text-foreground">{managedUser.designation}</strong></div>
+                )}
+              </div>
+            </div>
+
+            {/* Responder-Specific Details & Approval Audit */}
+            {(managedUser.rawRole === "RESPONDER" || managedUser.responderSubtype) && (
+              <div className="rounded-md border border-signal/30 bg-signal/5 p-3.5 space-y-2">
+                <p className="font-semibold uppercase tracking-wider text-signal text-[0.65rem]">
+                  Responder Operational Profile &amp; Approval Audit
+                </p>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <div><span className="text-muted-foreground">Classification:</span> <strong className="text-foreground">{managedUser.responderSubtype || "—"}</strong></div>
+                  <div><span className="text-muted-foreground">Operational Unit:</span> <strong className="text-foreground">{managedUser.requestedUnit || "GENERAL"}</strong></div>
+                  <div><span className="text-muted-foreground">Organization:</span> <strong className="text-foreground">{managedUser.organization || "Not provided"}</strong></div>
+                  <div><span className="text-muted-foreground">Designation:</span> <strong className="text-foreground">{managedUser.designation || "Not provided"}</strong></div>
+                  <div><span className="text-muted-foreground">Experience:</span> <strong className="text-foreground">{managedUser.experienceYears != null ? `${managedUser.experienceYears} years` : "Not provided"}</strong></div>
+                  <div><span className="text-muted-foreground">Duty / Assignment:</span> <strong className="text-foreground">{managedUser.dutyStatus || "OFF_DUTY"}{managedUser.activeIncidentId ? ` · ${managedUser.activeIncidentId}` : ""}</strong></div>
+                  {managedUser.credentialsSummary && (
+                    <div className="sm:col-span-2"><span className="text-muted-foreground">Qualifications:</span> <span className="text-foreground">{managedUser.credentialsSummary}</span></div>
+                  )}
+                </div>
+                {manageApprovalRecord ? (
+                  <div className="mt-2 rounded border border-border bg-background/80 p-2.5 space-y-0.5">
+                    <p className="font-semibold text-foreground">
+                      {manageApprovalRecord.decision === "REJECTED" ? "Rejected" : "Approved"} by{" "}
+                      {manageApprovalRecord.reviewerName || manageApprovalRecord.reviewerUid} —{" "}
+                      {manageApprovalRecord.reviewerCommandLevel === "ADMINISTRATOR" || manageApprovalRecord.reviewerRole === "ADMINISTRATOR"
+                        ? "Administrator"
+                        : "Coordinator"}
+                    </p>
+                    <p className="text-muted-foreground">
+                      Reviewer UID: <code className="font-mono">{manageApprovalRecord.reviewerUid}</code>
+                      {manageApprovalRecord.reviewedAtIso && ` · ${new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true }).format(new Date(manageApprovalRecord.reviewedAtIso))}`}
+                    </p>
+                    {manageApprovalRecord.reviewerNotes && (
+                      <p className="text-muted-foreground">Notes: {manageApprovalRecord.reviewerNotes}</p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-muted-foreground italic">
+                    {managedUser.invitationId ? "Provisioned via Administrator invitation." : "No separate vetting review record linked."}
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* Administrative Audit History */}
+            <div className="rounded-md border border-border bg-muted/20 p-3.5 space-y-2">
+              <p className="font-semibold uppercase tracking-wider text-muted-foreground text-[0.65rem]">
+                Administrative Audit History
+              </p>
+              {manageLoadingAudit ? (
+                <p className="text-muted-foreground">Loading audit history...</p>
+              ) : manageAuditLogs.length === 0 ? (
+                <p className="text-muted-foreground">No administrative actions recorded yet.</p>
+              ) : (
+                <div className="space-y-1.5">
+                  {manageAuditLogs.map((log) => (
+                    <div key={log.id} className="rounded border border-border bg-background p-2">
+                      <div className="flex flex-wrap items-center justify-between gap-1">
+                        <span className="font-semibold text-foreground">{log.action}</span>
+                        <span className="text-muted-foreground">
+                          {log.createdAtIso
+                            ? new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true }).format(new Date(log.createdAtIso))
+                            : "Recorded"}
+                        </span>
+                      </div>
+                      <p className="text-muted-foreground">
+                        By {log.actorName} ({log.actorDesignation || log.actorCommandLevel})
+                      </p>
+                      {log.reason && <p className="text-foreground mt-0.5">Reason: {log.reason}</p>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Suspend / Reactivate Actions */}
+            <div className="border-t border-border pt-4 space-y-3">
+              {!canChangeStatus ? (
+                <p className="text-muted-foreground italic">
+                  {isSelf
+                    ? "Self-suspension or self-modification is prohibited."
+                    : "Administrator accounts cannot be suspended or modified through this panel."}
+                </p>
+              ) : manageActionMode === "suspend" ? (
+                <div className="rounded-md border border-urgent/30 bg-urgent/5 p-3.5 space-y-3">
+                  <p className="font-semibold text-urgent">
+                    Confirm Account Suspension — {managedUser.displayName}
+                  </p>
+                  <p className="text-muted-foreground">
+                    Suspending this account immediately disables workspace access and blocks protected Firestore operations.
+                  </p>
+                  <div>
+                    <label className="block font-semibold text-foreground">
+                      Suspension Reason (Required)
+                      <Textarea
+                        required
+                        rows={2}
+                        placeholder="State the administrative reason for suspending this account..."
+                        value={suspendReason}
+                        onChange={(e) => setSuspendReason(e.target.value)}
+                        disabled={manageSubmitting}
+                        className="mt-1.5"
+                      />
+                    </label>
+                  </div>
+                  <div className="flex flex-wrap justify-end gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={manageSubmitting}
+                      onClick={() => {
+                        setManageActionMode(null);
+                        setSuspendReason("");
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="destructive"
+                      disabled={manageSubmitting || !suspendReason.trim()}
+                      onClick={async () => {
+                        setManageSubmitting(true);
+                        try {
+                          await suspendUserAccount(managedUser.uid, suspendReason);
+                          setReviewFeedback({
+                            type: "success",
+                            text: `Account ${managedUser.displayName} suspended and logged.`,
+                          });
+                          setManagedUser({ ...managedUser, accountStatus: "SUSPENDED", status: "Suspended" });
+                          setManageActionMode(null);
+                          setSuspendReason("");
+                          const logs = await fetchAccountAuditHistory(managedUser.uid, managedUser.invitationId).catch(() => []);
+                          setManageAuditLogs(logs);
+                          await refreshUsersAndApplications();
+                        } catch (err) {
+                          setReviewFeedback({
+                            type: "error",
+                            text: err?.message || "Failed to suspend account.",
+                          });
+                        } finally {
+                          setManageSubmitting(false);
+                        }
+                      }}
+                    >
+                      {manageSubmitting ? "Suspending..." : "Confirm Suspension"}
+                    </Button>
+                  </div>
+                </div>
+              ) : manageActionMode === "reactivate" ? (
+                <div className="rounded-md border border-safe/30 bg-safe/10 p-3.5 space-y-3">
+                  <p className="font-semibold text-safe">
+                    Confirm Account Reactivation — {managedUser.displayName}
+                  </p>
+                  <p className="text-muted-foreground">
+                    Reactivating restores account status to ACTIVE only. Role, verification, unit, and responder approval remain unchanged.
+                  </p>
+                  <div className="flex flex-wrap justify-end gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={manageSubmitting}
+                      onClick={() => setManageActionMode(null)}
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="bg-safe hover:bg-safe/90 text-white"
+                      disabled={manageSubmitting}
+                      onClick={async () => {
+                        setManageSubmitting(true);
+                        try {
+                          await reactivateUserAccount(managedUser.uid);
+                          setReviewFeedback({
+                            type: "success",
+                            text: `Account ${managedUser.displayName} reactivated and logged.`,
+                          });
+                          setManagedUser({ ...managedUser, accountStatus: "ACTIVE", status: "Active" });
+                          setManageActionMode(null);
+                          const logs = await fetchAccountAuditHistory(managedUser.uid, managedUser.invitationId).catch(() => []);
+                          setManageAuditLogs(logs);
+                          await refreshUsersAndApplications();
+                        } catch (err) {
+                          setReviewFeedback({
+                            type: "error",
+                            text: err?.message || "Failed to reactivate account.",
+                          });
+                        } finally {
+                          setManageSubmitting(false);
+                        }
+                      }}
+                    >
+                      {manageSubmitting ? "Reactivating..." : "Confirm Reactivation"}
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <Button type="button" size="sm" variant="outline" onClick={() => setManagedUser(null)}>
+                    Close
+                  </Button>
+                  {isTargetSuspended ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="bg-safe hover:bg-safe/90 text-white"
+                      onClick={() => setManageActionMode("reactivate")}
+                    >
+                      Reactivate Account
+                    </Button>
+                  ) : (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="destructive"
+                      onClick={() => setManageActionMode("suspend")}
+                    >
+                      Suspend Account
+                    </Button>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+
+        return isMobile ? (
+          <Sheet open={Boolean(managedUser)} onOpenChange={(open) => { if (!open && !manageSubmitting) setManagedUser(null); }}>
+            <SheetContent side="bottom" className="max-h-[88vh] overflow-y-auto pb-[env(safe-area-inset-bottom)]">
+              <SheetHeader>
+                <SheetTitle>Manage Account · {managedUser.displayName}</SheetTitle>
+                <SheetDescription>{managedUser.role} · {managedUser.email}</SheetDescription>
+              </SheetHeader>
+              <div className="mt-4">{manageBody}</div>
+            </SheetContent>
+          </Sheet>
+        ) : (
+          <Dialog open={Boolean(managedUser)} onOpenChange={(open) => { if (!open && !manageSubmitting) setManagedUser(null); }}>
+            <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
+              <DialogHeader>
+                <DialogTitle>Manage Account · {managedUser.displayName}</DialogTitle>
+                <DialogDescription>{managedUser.role} · {managedUser.email}</DialogDescription>
+              </DialogHeader>
+              {manageBody}
+            </DialogContent>
+          </Dialog>
+        );
+      })()}
 
       {/* Rejection Modal */}
       {reviewModal?.type === "reject" && (
@@ -1810,13 +2916,317 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
         </div>
       )}
 
+      {/* Account Management Dialog (Desktop/Tablet) / Bottom Sheet (Mobile) — Administrator Only */}
+      {managedUser && role === "ADMINISTRATOR" && (() => {
+        const isSelf = managedUser.uid === user?.uid;
+        const isTargetAdmin = managedUser.commandLevel === "ADMINISTRATOR";
+        const isTargetSuspended = managedUser.accountStatus === "SUSPENDED" || managedUser.status === "Suspended";
+        const canChangeStatus = !isSelf && !isTargetAdmin;
+        const locationStr = [managedUser.city, managedUser.district, managedUser.region].filter(Boolean).join(", ");
+        const regDateStr = managedUser.createdAtIso
+          ? new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", year: "numeric" }).format(new Date(managedUser.createdAtIso))
+          : "Unavailable";
+
+        const manageBody = (
+          <div className="space-y-5 text-xs">
+            {/* Profile Details */}
+            <div className="rounded-md border border-border bg-muted/20 p-3.5 space-y-2">
+              <p className="font-semibold uppercase tracking-wider text-muted-foreground text-[0.65rem]">
+                Profile &amp; Standing
+              </p>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <div><span className="text-muted-foreground">Full Name:</span> <strong className="text-foreground">{managedUser.displayName}</strong></div>
+                <div><span className="text-muted-foreground">Email:</span> <strong className="text-foreground break-all">{managedUser.email || "—"}</strong></div>
+                <div><span className="text-muted-foreground">Phone:</span> <strong className="text-foreground">{managedUser.phoneNumber || "Not provided"}</strong></div>
+                <div><span className="text-muted-foreground">Location:</span> <strong className="text-foreground">{locationStr || "Not provided"}</strong></div>
+                <div><span className="text-muted-foreground">UID:</span> <code className="font-mono text-[0.68rem] break-all">{managedUser.uid}</code></div>
+                <div><span className="text-muted-foreground">Email Verification:</span> <strong className={managedUser.emailVerified ? "text-safe" : "text-urgent"}>{managedUser.emailVerified ? "Verified" : "Unverified"}</strong></div>
+                <div><span className="text-muted-foreground">Registered:</span> <strong className="text-foreground">{regDateStr}</strong></div>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-muted-foreground">Account Status:</span>
+                  <Pill tone={isTargetSuspended ? "warn" : "good"}>{isTargetSuspended ? "SUSPENDED" : "ACTIVE"}</Pill>
+                </div>
+              </div>
+            </div>
+
+            {/* Authorization Overview */}
+            <div className="rounded-md border border-border bg-muted/20 p-3.5 space-y-2">
+              <p className="font-semibold uppercase tracking-wider text-muted-foreground text-[0.65rem]">
+                Authorization Overview
+              </p>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <div><span className="text-muted-foreground">Role:</span> <strong className="text-foreground">{managedUser.role}</strong></div>
+                <div>
+                  <span className="text-muted-foreground">Capabilities:</span>{" "}
+                  <strong className="text-foreground">
+                    {managedUser.capabilities?.length > 0 ? managedUser.capabilities.join(", ") : "None (Command / Pending)"}
+                  </strong>
+                </div>
+                {managedUser.designation && (
+                  <div className="sm:col-span-2"><span className="text-muted-foreground">Designation:</span> <strong className="text-foreground">{managedUser.designation}</strong></div>
+                )}
+              </div>
+            </div>
+
+            {/* Responder-Specific Details & Approval Audit */}
+            {(managedUser.rawRole === "RESPONDER" || managedUser.responderSubtype) && (
+              <div className="rounded-md border border-signal/30 bg-signal/5 p-3.5 space-y-2">
+                <p className="font-semibold uppercase tracking-wider text-signal text-[0.65rem]">
+                  Responder Operational Profile &amp; Approval Audit
+                </p>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <div><span className="text-muted-foreground">Classification:</span> <strong className="text-foreground">{managedUser.responderSubtype || "—"}</strong></div>
+                  <div><span className="text-muted-foreground">Operational Unit:</span> <strong className="text-foreground">{managedUser.requestedUnit || "GENERAL"}</strong></div>
+                  <div><span className="text-muted-foreground">Organization:</span> <strong className="text-foreground">{managedUser.organization || "Not provided"}</strong></div>
+                  <div><span className="text-muted-foreground">Designation:</span> <strong className="text-foreground">{managedUser.designation || "Not provided"}</strong></div>
+                  <div><span className="text-muted-foreground">Experience:</span> <strong className="text-foreground">{managedUser.experienceYears != null ? `${managedUser.experienceYears} years` : "Not provided"}</strong></div>
+                  <div><span className="text-muted-foreground">Duty / Assignment:</span> <strong className="text-foreground">{managedUser.dutyStatus || "OFF_DUTY"}{managedUser.activeIncidentId ? ` · ${managedUser.activeIncidentId}` : ""}</strong></div>
+                  {managedUser.credentialsSummary && (
+                    <div className="sm:col-span-2"><span className="text-muted-foreground">Qualifications:</span> <span className="text-foreground">{managedUser.credentialsSummary}</span></div>
+                  )}
+                </div>
+                {manageApprovalRecord ? (
+                  <div className="mt-2 rounded border border-border bg-background/80 p-2.5 space-y-0.5">
+                    <p className="font-semibold text-foreground">
+                      {manageApprovalRecord.decision === "REJECTED" ? "Rejected" : "Approved"} by{" "}
+                      {manageApprovalRecord.reviewerName || manageApprovalRecord.reviewerUid} —{" "}
+                      {manageApprovalRecord.reviewerCommandLevel === "ADMINISTRATOR" || manageApprovalRecord.reviewerRole === "ADMINISTRATOR"
+                        ? "Administrator"
+                        : "Coordinator"}
+                    </p>
+                    <p className="text-muted-foreground">
+                      Reviewer UID: <code className="font-mono">{manageApprovalRecord.reviewerUid}</code>
+                      {manageApprovalRecord.reviewedAtIso && ` · ${new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true }).format(new Date(manageApprovalRecord.reviewedAtIso))}`}
+                    </p>
+                    {manageApprovalRecord.reviewerNotes && (
+                      <p className="text-muted-foreground">Notes: {manageApprovalRecord.reviewerNotes}</p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-muted-foreground italic">
+                    {managedUser.invitationId ? "Provisioned via Administrator invitation." : "No separate vetting review record linked."}
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* Administrative Audit History */}
+            <div className="rounded-md border border-border bg-muted/20 p-3.5 space-y-2">
+              <p className="font-semibold uppercase tracking-wider text-muted-foreground text-[0.65rem]">
+                Administrative Audit History
+              </p>
+              {manageLoadingAudit ? (
+                <p className="text-muted-foreground">Loading audit history...</p>
+              ) : manageAuditLogs.length === 0 ? (
+                <p className="text-muted-foreground">No administrative actions recorded yet.</p>
+              ) : (
+                <div className="space-y-1.5">
+                  {manageAuditLogs.map((log) => (
+                    <div key={log.id} className="rounded border border-border bg-background p-2">
+                      <div className="flex flex-wrap items-center justify-between gap-1">
+                        <span className="font-semibold text-foreground">{log.action}</span>
+                        <span className="text-muted-foreground">
+                          {log.createdAtIso
+                            ? new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true }).format(new Date(log.createdAtIso))
+                            : "Recorded"}
+                        </span>
+                      </div>
+                      <p className="text-muted-foreground">
+                        By {log.actorName} ({log.actorDesignation || log.actorCommandLevel})
+                      </p>
+                      {log.reason && <p className="text-foreground mt-0.5">Reason: {log.reason}</p>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Suspend / Reactivate Actions */}
+            <div className="border-t border-border pt-4 space-y-3">
+              {!canChangeStatus ? (
+                <p className="text-muted-foreground italic">
+                  {isSelf
+                    ? "Self-suspension or self-modification is prohibited."
+                    : "Administrator accounts cannot be suspended or modified through this panel."}
+                </p>
+              ) : manageActionMode === "suspend" ? (
+                <div className="rounded-md border border-urgent/30 bg-urgent/5 p-3.5 space-y-3">
+                  <p className="font-semibold text-urgent">
+                    Confirm Account Suspension — {managedUser.displayName}
+                  </p>
+                  <p className="text-muted-foreground">
+                    Suspending this account immediately disables workspace access and blocks protected Firestore operations.
+                  </p>
+                  <div>
+                    <label className="block font-semibold text-foreground">
+                      Suspension Reason (Required)
+                      <Textarea
+                        required
+                        rows={2}
+                        placeholder="State the administrative reason for suspending this account..."
+                        value={suspendReason}
+                        onChange={(e) => setSuspendReason(e.target.value)}
+                        disabled={manageSubmitting}
+                        className="mt-1.5"
+                      />
+                    </label>
+                  </div>
+                  <div className="flex flex-wrap justify-end gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={manageSubmitting}
+                      onClick={() => {
+                        setManageActionMode(null);
+                        setSuspendReason("");
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="destructive"
+                      disabled={manageSubmitting || !suspendReason.trim()}
+                      onClick={async () => {
+                        setManageSubmitting(true);
+                        try {
+                          await suspendUserAccount(managedUser.uid, suspendReason);
+                          setReviewFeedback({
+                            type: "success",
+                            text: `Account ${managedUser.displayName} suspended and logged.`,
+                          });
+                          setManagedUser({ ...managedUser, accountStatus: "SUSPENDED", status: "Suspended" });
+                          setManageActionMode(null);
+                          setSuspendReason("");
+                          const logs = await fetchAccountAuditHistory(managedUser.uid, managedUser.invitationId).catch(() => []);
+                          setManageAuditLogs(logs);
+                          await refreshUsersAndApplications();
+                        } catch (err) {
+                          setReviewFeedback({
+                            type: "error",
+                            text: err?.message || "Failed to suspend account.",
+                          });
+                        } finally {
+                          setManageSubmitting(false);
+                        }
+                      }}
+                    >
+                      {manageSubmitting ? "Suspending..." : "Confirm Suspension"}
+                    </Button>
+                  </div>
+                </div>
+              ) : manageActionMode === "reactivate" ? (
+                <div className="rounded-md border border-safe/30 bg-safe/10 p-3.5 space-y-3">
+                  <p className="font-semibold text-safe">
+                    Confirm Account Reactivation — {managedUser.displayName}
+                  </p>
+                  <p className="text-muted-foreground">
+                    Reactivating restores account status to ACTIVE only. Role, verification, unit, and responder approval remain unchanged.
+                  </p>
+                  <div className="flex flex-wrap justify-end gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={manageSubmitting}
+                      onClick={() => setManageActionMode(null)}
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="bg-safe hover:bg-safe/90 text-white"
+                      disabled={manageSubmitting}
+                      onClick={async () => {
+                        setManageSubmitting(true);
+                        try {
+                          await reactivateUserAccount(managedUser.uid);
+                          setReviewFeedback({
+                            type: "success",
+                            text: `Account ${managedUser.displayName} reactivated and logged.`,
+                          });
+                          setManagedUser({ ...managedUser, accountStatus: "ACTIVE", status: "Active" });
+                          setManageActionMode(null);
+                          const logs = await fetchAccountAuditHistory(managedUser.uid, managedUser.invitationId).catch(() => []);
+                          setManageAuditLogs(logs);
+                          await refreshUsersAndApplications();
+                        } catch (err) {
+                          setReviewFeedback({
+                            type: "error",
+                            text: err?.message || "Failed to reactivate account.",
+                          });
+                        } finally {
+                          setManageSubmitting(false);
+                        }
+                      }}
+                    >
+                      {manageSubmitting ? "Reactivating..." : "Confirm Reactivation"}
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <Button type="button" size="sm" variant="outline" onClick={() => setManagedUser(null)}>
+                    Close
+                  </Button>
+                  {isTargetSuspended ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="bg-safe hover:bg-safe/90 text-white"
+                      onClick={() => setManageActionMode("reactivate")}
+                    >
+                      Reactivate Account
+                    </Button>
+                  ) : (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="destructive"
+                      onClick={() => setManageActionMode("suspend")}
+                    >
+                      Suspend Account
+                    </Button>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+
+        return isMobile ? (
+          <Sheet open={Boolean(managedUser)} onOpenChange={(open) => { if (!open && !manageSubmitting) setManagedUser(null); }}>
+            <SheetContent side="bottom" className="max-h-[88vh] overflow-y-auto pb-[env(safe-area-inset-bottom)]">
+              <SheetHeader>
+                <SheetTitle>Manage Account · {managedUser.displayName}</SheetTitle>
+                <SheetDescription>{managedUser.role} · {managedUser.email}</SheetDescription>
+              </SheetHeader>
+              <div className="mt-4">{manageBody}</div>
+            </SheetContent>
+          </Sheet>
+        ) : (
+          <Dialog open={Boolean(managedUser)} onOpenChange={(open) => { if (!open && !manageSubmitting) setManagedUser(null); }}>
+            <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
+              <DialogHeader>
+                <DialogTitle>Manage Account · {managedUser.displayName}</DialogTitle>
+                <DialogDescription>{managedUser.role} · {managedUser.email}</DialogDescription>
+              </DialogHeader>
+              {manageBody}
+            </DialogContent>
+          </Dialog>
+        );
+      })()}
+
       <p role="status" className="mt-2 text-sm text-safe">
         {message}
       </p>
     </section>);
   if (role === "RESPONDER") {
-    const assignedToMe = (rawIncidents || []).filter((i) => (user?.uid && (i.assignedResponderIds?.includes(user.uid) || i.assignedResponderId === user.uid)));
-    const displayQueue = assignedToMe.length > 0 ? assignedToMe.map(toDisplayIncident) : incidents;
+    const assignedToMe = (rawIncidents || []).filter((i) => (user?.uid && (i.assignedResponderId === user.uid || i.assignedResponderIds?.includes(user.uid))));
+    const displayQueue = assignedToMe.map(toDisplayIncident);
     return (<div className="space-y-8">
       <div className="flex flex-wrap items-center justify-between gap-4 border-b border-border pb-5">
         <div>
@@ -1870,23 +3280,19 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
           <p className="mt-2 text-sm leading-6 text-muted-foreground">
             Keep your assignment status current for the Command coordination team.
           </p>
-          <Button className="mt-4" onClick={async () => {
+          <Button className="mt-4" disabled={!displayQueue[0] || actionLoading} onClick={() => {
             if (displayQueue[0]) {
-              await setStatus("In progress");
-              setMessage(`Travelling status confirmed for ${displayQueue[0].id}.`);
-            }
-            else {
-              setMessage("Travelling status logged in local operation log.");
+              void handleResponderFieldStep(displayQueue[0].id, "En route");
             }
           }}>
-            Mark travelling
+            Mark En route
           </Button>
           {message && (<p role="status" className="mt-3 text-sm text-safe">
             {message}
           </p>)}
         </div>
       </div>
-      {selected && (<IncidentDialog incident={selected} onClose={() => setSelected(null)} onStatus={setStatus} onAssign={handleAssignResponder} responders={operationalUsers} isCommand={false} />)}
+      {selected && (<IncidentDialog incident={selected} onClose={() => setSelected(null)} onStatus={setStatus} onAssign={handleAssignResponder} onCloseIncident={handleCloseIncident} onResponderDecision={handleResponderDecision} onResponderFieldStep={handleResponderFieldStep} responders={operationalUsers} isCommand={false} viewerRole={role} viewerUid={user?.uid} assignments={myAssignments} assignmentsStatus={assignmentsStatus} actionLoading={actionLoading} />)}
     </div>);
   }
   if (command) {
@@ -1950,7 +3356,7 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
           </section>
         </div>
       </div>
-      {selected && (<IncidentDialog incident={selected} onClose={() => setSelected(null)} onStatus={setStatus} onAssign={handleAssignResponder} responders={operationalUsers} isCommand={true} />)}
+      {selected && (<IncidentDialog incident={selected} onClose={() => setSelected(null)} onStatus={setStatus} onAssign={handleAssignResponder} onCloseIncident={handleCloseIncident} onResponderDecision={handleResponderDecision} onResponderFieldStep={handleResponderFieldStep} responders={operationalUsers} isCommand={true} viewerRole={role} viewerUid={user?.uid} assignments={myAssignments} assignmentsStatus={assignmentsStatus} actionLoading={actionLoading} />)}
     </div>);
   }
   return (<section className="max-w-3xl">
@@ -1976,25 +3382,71 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
     </Button>
   </section>);
 }
-function IncidentDialog({ incident, onClose, onStatus, onAssign, responders = [], isCommand = false, }) {
+function IncidentDialog({ incident, onClose, onStatus, onAssign, onCloseIncident, onResponderDecision, onResponderFieldStep, responders = [], isCommand = false, viewerRole = "CITIZEN", viewerUid = null, assignments = [], assignmentsStatus = "ready", actionLoading = false, }) {
   const [selectedResponder, setSelectedResponder] = useState("");
+  const [timelineEvents, setTimelineEvents] = useState([]);
+  const [incidentAssignments, setIncidentAssignments] = useState([]);
+  const [closingNotes, setClosingNotes] = useState("");
+  const [fieldNotes, setFieldNotes] = useState("");
+  const [declineNote, setDeclineNote] = useState("");
+
+  useEffect(() => {
+    const unsubTimeline = subscribeToIncidentTimeline(incident.id, setTimelineEvents, () => {});
+    let unsubAsg = null;
+    if (isCommand) {
+      unsubAsg = subscribeToIncidentAssignments(incident.id, setIncidentAssignments, () => {});
+    }
+    return () => {
+      if (typeof unsubTimeline === "function") unsubTimeline();
+      if (typeof unsubAsg === "function") unsubAsg();
+    };
+  }, [incident.id, isCommand]);
+
+  const eligibleProfessionals = responders.filter(
+    (r) =>
+      r.rawRole === "RESPONDER" &&
+      r.responderSubtype === "PROFESSIONAL" &&
+      r.accountStatus === "ACTIVE" &&
+      r.dutyStatus === "AVAILABLE" &&
+      !r.activeIncidentId
+  );
+
+  const isAssignedResponder = Boolean(
+    viewerRole === "RESPONDER" &&
+      viewerUid &&
+      (incident.assignedResponderId === viewerUid || incident.assignedResponderIds?.includes(viewerUid))
+  );
+  const myAsg = isAssignedResponder
+    ? assignments.find((a) => a.incidentId === incident.id && a.status === "ACTIVE")
+    : null;
+  const isOfferPending = Boolean(myAsg && (!myAsg.acceptanceStatus || myAsg.acceptanceStatus === "OFFERED"));
+  const currentStepIdx = RESPONDER_FIELD_SEQUENCE.indexOf(incident.status);
+  const nextResponderStep =
+    currentStepIdx >= 0 && currentStepIdx < RESPONDER_FIELD_SEQUENCE.length - 1
+      ? RESPONDER_FIELD_SEQUENCE[currentStepIdx + 1]
+      : null;
+
+  const latestAssignment = incidentAssignments[0] || null;
+  const isClosed = incident.status === "Closed";
+  const isResolved = incident.status === "Resolved";
+
   return (<div className="fixed inset-0 z-50 flex items-end justify-center bg-ink/60 p-0 sm:items-center sm:p-5" role="presentation" onMouseDown={(e) => {
     if (e.target === e.currentTarget)
       onClose();
   }}>
-    <section role="dialog" aria-modal="true" aria-labelledby="incident-title" className="w-full max-w-xl border border-border bg-background p-5 shadow-xl sm:p-7">
+    <section role="dialog" aria-modal="true" aria-labelledby="incident-title" className="max-h-[90svh] w-full max-w-xl overflow-y-auto rounded-t-xl border border-border bg-background p-5 shadow-xl sm:rounded-lg sm:p-7">
       <div className="flex items-start justify-between gap-3">
-        <div>
+        <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <Pill tone="signal">{incident.priority} PRIORITY</Pill>
-            {incident.syncStatus && (<Pill tone={incident.syncStatus === "SYNCED" ? "good" : "neutral"}>
+            {incident.syncStatus && (<Pill tone={incident.syncStatus === "SYNCED" ? "good" : incident.syncStatus === "SYNC_FAILED" ? "warn" : "neutral"}>
               {incident.syncStatus}
             </Pill>)}
           </div>
-          <h2 id="incident-title" className="mt-3 font-display text-xl font-semibold">
+          <h2 id="incident-title" className="mt-3 font-display text-xl font-semibold break-words">
             {incident.id} · {incident.type}
           </h2>
-          <p className="mt-1 text-sm text-muted-foreground">
+          <p className="mt-1 text-sm text-muted-foreground break-words">
             {incident.place} · {incident.time}
           </p>
         </div>
@@ -2002,48 +3454,134 @@ function IncidentDialog({ incident, onClose, onStatus, onAssign, responders = []
           <X />
         </Button>
       </div>
-      <div className="my-5 border-y border-border py-4">
-        <p className="text-xs font-semibold uppercase text-muted-foreground">Incident details & timeline</p>
-        {incident.description && (<p className="mt-2 text-sm italic text-foreground">"{incident.description}"</p>)}
-        <p className="mt-3 text-sm">Report created · {incident.time}</p>
-        <p className="mt-1 text-sm">Current status · <span className="font-semibold">{incident.status}</span></p>
-        {incident.assignedResponderIds && incident.assignedResponderIds.length > 0 && (<p className="mt-1 text-xs text-muted-foreground">
-          Assigned units: {incident.assignedResponderIds.join(", ")}
+      <div className="my-5 border-y border-border py-4 space-y-2">
+        <p className="text-xs font-semibold uppercase text-muted-foreground">Incident details &amp; timeline</p>
+        {incident.description && (<p className="text-sm italic text-foreground break-words">"{incident.description}"</p>)}
+        <p className="text-sm">Report created · {incident.time}</p>
+        <p className="text-sm">Current status · <span className="font-semibold">{incident.status}</span></p>
+        {incident.notes && (<p className="text-xs text-muted-foreground break-words">Notes: {incident.notes}</p>)}
+        {incident.syncError && (<p className="text-xs text-urgent break-words">Sync error: {incident.syncError}</p>)}
+        {incident.assignedResponderIds && incident.assignedResponderIds.length > 0 && (<p className="text-xs text-muted-foreground break-all">
+          Assigned unit: {incident.assignedResponderIds.join(", ")}
         </p>)}
+        {isCommand && latestAssignment && (
+          <p className="text-xs text-muted-foreground">
+            Assignment state: <strong className="text-foreground">{latestAssignment.acceptanceStatus || latestAssignment.status}</strong>
+            {latestAssignment.declineReason ? ` (${latestAssignment.declineReason})` : ""}
+          </p>
+        )}
+        {timelineEvents.length > 0 && (
+          <div className="mt-3 border-t border-border pt-3 space-y-1.5">
+            <p className="text-[0.7rem] font-semibold uppercase text-muted-foreground">Operational Timeline</p>
+            {timelineEvents.map((evt) => (
+              <div key={evt.id} className="text-xs text-muted-foreground flex flex-wrap justify-between gap-2">
+                <span className="text-foreground">{evt.details || evt.eventType}</span>
+                <span className="font-mono text-[0.68rem]">{evt.actorRole}</span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
-      {isCommand && responders.length > 0 && (<div className="mb-5 border-b border-border pb-4">
-        <p className="text-xs font-semibold uppercase text-muted-foreground mb-2">Assign Field Unit</p>
-        <div className="flex flex-wrap gap-2">
-          <select aria-label="Select responder to assign" value={selectedResponder} onChange={(e) => setSelectedResponder(e.target.value)} className="h-9 rounded-md border border-input bg-background px-3 text-xs flex-1 min-w-[200px]">
-            <option value="">-- Choose Field Responder --</option>
-            {responders
-              .filter((r) => r.role.toLowerCase().includes("responder"))
-              .map((r) => (<option key={r.uid} value={r.uid}>
-                {r.displayName} ({r.role})
-              </option>))}
-          </select>
-          <Button size="sm" disabled={!selectedResponder} onClick={() => {
-            const target = responders.find((r) => r.uid === selectedResponder);
-            if (target && onAssign)
-              onAssign(target.uid, target.displayName);
-          }}>
-            Dispatch Unit
-          </Button>
+      {isCommand && !isResolved && !isClosed && (
+        <div className="mb-5 border-b border-border pb-4 space-y-2">
+          <p className="text-xs font-semibold uppercase text-muted-foreground">Dispatch Professional Responder</p>
+          {eligibleProfessionals.length > 0 ? (
+            <div className="flex flex-wrap gap-2">
+              <select aria-label="Select responder to assign" value={selectedResponder} onChange={(e) => setSelectedResponder(e.target.value)} className="h-10 rounded-md border border-input bg-background px-3 text-xs flex-1 min-w-[200px]">
+                <option value="">-- Choose Available Professional Unit --</option>
+                {eligibleProfessionals.map((r) => (<option key={r.uid} value={r.uid}>
+                  {r.displayName} ({r.requestedUnit || "GENERAL"} · AVAILABLE)
+                </option>))}
+              </select>
+              <Button size="sm" className="min-h-10" disabled={!selectedResponder || actionLoading} onClick={() => {
+                const target = eligibleProfessionals.find((r) => r.uid === selectedResponder);
+                if (target && onAssign)
+                  onAssign(target.uid, target.displayName);
+              }}>
+                Dispatch Unit
+              </Button>
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              No ACTIVE, AVAILABLE Professional responders are currently free for dispatch.
+            </p>
+          )}
         </div>
-      </div>)}
+      )}
 
-      <div className="flex flex-wrap gap-2">
-        <Button size="sm" onClick={() => onStatus("Acknowledged")}>
-          Acknowledge
-        </Button>
-        <Button size="sm" variant="outline" onClick={() => onStatus("In progress")}>
-          Mark in progress
-        </Button>
-        <Button size="sm" variant="outline" onClick={() => onStatus("Resolved")}>
-          Resolve
-        </Button>
-      </div>
+      {isCommand && (
+        <div className="space-y-3">
+          <div className="flex flex-wrap gap-2">
+            {!isResolved && !isClosed && (
+              <Button size="sm" className="min-h-10" disabled={actionLoading} onClick={() => onStatus("Acknowledged")}>
+                Acknowledge
+              </Button>
+            )}
+            {isResolved && !isClosed && (
+              <Button size="sm" variant="outline" className="min-h-10" disabled={actionLoading} onClick={() => onCloseIncident && onCloseIncident(closingNotes)}>
+                Verify &amp; Close Incident
+              </Button>
+            )}
+          </div>
+          {isResolved && !isClosed && (
+            <Input
+              value={closingNotes}
+              onChange={(e) => setClosingNotes(e.target.value)}
+              placeholder="Optional Command verification / closure note..."
+              className="text-xs"
+            />
+          )}
+        </div>
+      )}
+
+      {isAssignedResponder && !isResolved && !isClosed && (
+        <div className="space-y-3">
+          {assignmentsStatus === "loading" ? (
+            <p className="text-xs text-muted-foreground">Verifying assignment state...</p>
+          ) : assignmentsStatus === "error" || !myAsg ? (
+            <p className="text-xs text-urgent">Unable to verify active assignment state. Operational actions are locked.</p>
+          ) : isOfferPending ? (
+            <>
+              <p className="text-xs font-semibold uppercase text-signal">Dispatch Offer Pending Acceptance</p>
+              <Input
+                value={declineNote}
+                onChange={(e) => setDeclineNote(e.target.value)}
+                placeholder="Optional decline reason..."
+                className="text-xs"
+              />
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" className="min-h-10" disabled={actionLoading} onClick={() => onResponderDecision && onResponderDecision(incident.id, "ACCEPTED")}>
+                  Accept Dispatch
+                </Button>
+                <Button size="sm" variant="outline" className="min-h-10" disabled={actionLoading} onClick={() => onResponderDecision && onResponderDecision(incident.id, "DECLINED", declineNote)}>
+                  Decline Dispatch
+                </Button>
+              </div>
+            </>
+          ) : nextResponderStep ? (
+            <>
+              <Input
+                value={fieldNotes}
+                onChange={(e) => setFieldNotes(e.target.value)}
+                placeholder="Optional field / resolution note..."
+                className="text-xs"
+              />
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" className="min-h-10" disabled={actionLoading} onClick={() => onResponderFieldStep && onResponderFieldStep(incident.id, nextResponderStep, fieldNotes)}>
+                  Advance to: {nextResponderStep}
+                </Button>
+              </div>
+            </>
+          ) : null}
+        </div>
+      )}
+
+      {!isCommand && !isAssignedResponder && (
+        <p className="text-xs text-muted-foreground">
+          Status updates are managed by Command Operations and your assigned emergency responder.
+        </p>
+      )}
     </section>
   </div>);
 }
@@ -2122,6 +3660,7 @@ function AuthPage({ path }) {
 }
 export function BeaconPage() {
   const path = useRouterState({ select: (s) => s.location.pathname });
+  const navigate = useNavigate();
   const { user, profile, status, loading: authLoading, signOut } = useAuth();
   const [role, setRole] = useState("CITIZEN");
   const [incidents, setIncidents] = useState(initialIncidents);
@@ -2129,6 +3668,37 @@ export function BeaconPage() {
   const [incidentsReady, setIncidentsReady] = useState(false);
   const [responderType, setResponderType] = useState("PROFESSIONAL");
   const [demoPreviewActive, setDemoPreviewActive] = useState(false);
+  const [notifications, setNotifications] = useState([]);
+  const [notificationsLoading, setNotificationsLoading] = useState(false);
+  const [notificationsError, setNotificationsError] = useState("");
+  const [notifNonce, setNotifNonce] = useState(0);
+  // Real-time user-scoped notification subscription (clears on logout/account switch)
+  useEffect(() => {
+    if (!user?.uid) {
+      setNotifications([]);
+      setNotificationsLoading(false);
+      setNotificationsError("");
+      return;
+    }
+    setNotifications([]);
+    setNotificationsLoading(true);
+    setNotificationsError("");
+    const unsubscribe = subscribeToUserNotifications(
+      user.uid,
+      (list) => {
+        setNotifications(list);
+        setNotificationsLoading(false);
+      },
+      (err) => {
+        setNotificationsError(err?.message || "Failed to load notifications.");
+        setNotificationsLoading(false);
+      }
+    );
+    return () => {
+      if (typeof unsubscribe === "function")
+        unsubscribe();
+    };
+  }, [user?.uid, notifNonce]);
   // Initialize offline sync queue worker
   useEffect(() => {
     const cleanup = initAutoSync();
@@ -2179,11 +3749,18 @@ export function BeaconPage() {
     }
   };
   useEffect(() => {
-    const activeRole = profile?.role ||
-      (path.startsWith("/command") ? "COMMAND" : path.startsWith("/responder") ? "RESPONDER" : "CITIZEN");
+    const activeRole = path.startsWith("/command")
+      ? "COMMAND"
+      : path.startsWith("/citizen")
+        ? "CITIZEN"
+        : path.startsWith("/responder")
+          ? "RESPONDER"
+          : (profile?.role || "CITIZEN");
+    const includeCitizenOwned = Boolean(profile?.capabilities?.includes("CITIZEN"));
     const unsubscribe = subscribeToIncidents({
       role: activeRole,
       userId: user?.uid,
+      includeCitizenOwned,
       onUpdate: (records) => {
         setRawIncidents(records);
         if (records.length > 0) {
@@ -2578,9 +4155,23 @@ export function BeaconPage() {
                 <span className="h-1.5 w-1.5 rounded-full bg-safe" />
                 {user ? "Online · Synced" : "Connectivity · preview"}
               </Pill>
-              <Button variant="ghost" size="icon" aria-label="Notifications" title="Notifications" onClick={() => window.alert("No new preview notifications.")}>
-                <Bell />
-              </Button>
+              <NotificationCenter
+                notifications={notifications}
+                loading={notificationsLoading}
+                error={notificationsError}
+                isAuthenticated={Boolean(user?.uid)}
+                onMarkRead={(id) => user?.uid && markNotificationAsRead(id, user.uid)}
+                onMarkAllRead={() => user?.uid && markAllNotificationsAsRead(notifications, user.uid)}
+                onRefresh={() => setNotifNonce((n) => n + 1)}
+                onSelectIncident={(incidentId) => {
+                  const targetPath = isCommand
+                    ? "/command/incidents"
+                    : isResponder
+                      ? "/responder/status"
+                      : "/citizen/reports";
+                  void navigate({ to: targetPath, search: { incident: incidentId } });
+                }}
+              />
             </div>
           </div>
           {path.startsWith("/responder/incidents/") ? (<DashboardContent path="/citizen/reports" role={routeRole} incidents={incidents} setIncidents={setIncidents} rawIncidents={rawIncidents} onRefresh={loadIncidents} />) : (<DashboardContent path={path} role={routeRole} incidents={incidents} setIncidents={setIncidents} rawIncidents={rawIncidents} onRefresh={loadIncidents} />)}

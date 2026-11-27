@@ -13,6 +13,7 @@ import {
   logOut,
 } from "@/lib/auth-service";
 import { createInitialUserProfile } from "@/lib/user-service";
+import { fetchInvitationForInvitee, claimInvitationAndCreateProfile } from "@/lib/services/command-service";
 import { WORKSPACE_ROUTES, PENDING_RESPONDER_ROUTE } from "@/lib/auth-types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -56,11 +57,16 @@ export function RegistrationWizard() {
     select: (s) => new URLSearchParams(s.location.search),
   });
 
+  const inviteIdParam = searchParams.get("invite");
+  const inviteEmailParam = searchParams.get("email");
+  const [activeInvitation, setActiveInvitation] = useState(null);
+  const [invitationError, setInvitationError] = useState(null);
+
   // Step indicator state
   const [currentStep, setCurrentStep] = useState(1);
 
   // Step 1: Email Verification States
-  const [email, setEmail] = useState("");
+  const [email, setEmail] = useState(() => inviteEmailParam || "");
   const [linkSent, setLinkSent] = useState(false);
   const [cooldown, setCooldown] = useState(0);
   const [verifyingLink, setVerifyingLink] = useState(false);
@@ -391,6 +397,35 @@ export function RegistrationWizard() {
     }
   };
 
+  // When verified & inviteIdParam is present, fetch and validate the invitation
+  useEffect(() => {
+    if (!inviteIdParam || !currentUser || !currentUser.emailVerified || activeInvitation) return;
+    let cancelled = false;
+    fetchInvitationForInvitee(inviteIdParam)
+      .then((inv) => {
+        if (cancelled) return;
+        setActiveInvitation(inv);
+        setInvitationError(null);
+        if (inv.fullName && !fullName) setFullName(inv.fullName);
+        if (inv.targetRole === "COMMAND") {
+          setSelectedRole("COMMAND");
+        } else if (inv.targetRole === "RESPONDER") {
+          setSelectedRole("RESPONDER");
+          if (inv.targetResponderSubtype) setResponderSubtype(inv.targetResponderSubtype);
+          if (inv.targetUnit) setRequestedUnit(inv.targetUnit);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setInvitationError(err?.message || "Unable to validate invitation.");
+          setError(err?.message || "Unable to validate invitation.");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [inviteIdParam, currentUser, activeInvitation]);
+
   // Step 2: Validate Personal Details & Advance to Step 3
   const handleStep2Submit = (e) => {
     e.preventDefault();
@@ -398,6 +433,27 @@ export function RegistrationWizard() {
 
     if (!fullName.trim()) {
       setError("Please provide your full legal name.");
+      return;
+    }
+
+    if (activeInvitation) {
+      if (activeInvitation.targetRole === "RESPONDER") {
+        if (!phoneNumber.trim()) {
+          setError("A valid operational phone number is required for emergency responder personnel.");
+          return;
+        }
+        if (activeInvitation.targetResponderSubtype === "PROFESSIONAL") {
+          if (!organization.trim()) {
+            setError("Please specify your emergency response agency or organization.");
+            return;
+          }
+          if (!designation.trim()) {
+            setError("Please specify your professional designation or title.");
+            return;
+          }
+        }
+      }
+      setCurrentStep(3);
       return;
     }
 
@@ -497,21 +553,33 @@ export function RegistrationWizard() {
         console.warn("Could not set displayName on Auth user:", nameErr);
       }
 
-      // 4. Create initial profile in Cloud Firestore (throws on failure)
-      const createdProfile = await createInitialUserProfile(verification.user, {
-        fullName: fullName.trim(),
-        phoneNumber: phoneNumber.trim() || undefined,
-        role: selectedRole,
-        responderSubtype: selectedRole === "RESPONDER" ? responderSubtype : undefined,
-        region: region.trim(),
-        district: district.trim(),
-        city: city.trim(),
-        organization: selectedRole === "RESPONDER" ? organization.trim() : undefined,
-        requestedUnit: selectedRole === "RESPONDER" ? requestedUnit : undefined,
-        designation: selectedRole === "RESPONDER" ? designation.trim() : undefined,
-        experienceYears: selectedRole === "RESPONDER" ? Number(experienceYears) || 0 : undefined,
-        credentialsSummary: selectedRole === "RESPONDER" ? credentialsSummary.trim() : undefined,
-      });
+      // 4. Create initial profile in Cloud Firestore (atomic invitation claim if invited)
+      const createdProfile = activeInvitation
+        ? await claimInvitationAndCreateProfile(verification.user, activeInvitation, {
+            fullName: fullName.trim(),
+            phoneNumber: phoneNumber.trim() || undefined,
+            region: region.trim(),
+            district: district.trim(),
+            city: city.trim(),
+            organization: organization.trim() || undefined,
+            designation: designation.trim() || undefined,
+            experienceYears: activeInvitation.targetRole === "RESPONDER" ? Number(experienceYears) || 0 : undefined,
+            credentialsSummary: activeInvitation.targetRole === "RESPONDER" ? credentialsSummary.trim() || undefined : undefined,
+          })
+        : await createInitialUserProfile(verification.user, {
+            fullName: fullName.trim(),
+            phoneNumber: phoneNumber.trim() || undefined,
+            role: selectedRole,
+            responderSubtype: selectedRole === "RESPONDER" ? responderSubtype : undefined,
+            region: region.trim(),
+            district: district.trim(),
+            city: city.trim(),
+            organization: selectedRole === "RESPONDER" ? organization.trim() : undefined,
+            requestedUnit: selectedRole === "RESPONDER" ? requestedUnit : undefined,
+            designation: selectedRole === "RESPONDER" ? designation.trim() : undefined,
+            experienceYears: selectedRole === "RESPONDER" ? Number(experienceYears) || 0 : undefined,
+            credentialsSummary: selectedRole === "RESPONDER" ? credentialsSummary.trim() : undefined,
+          });
 
       if (!createdProfile) {
         throw new Error("Profile creation could not be confirmed.");
@@ -528,7 +596,13 @@ export function RegistrationWizard() {
       await refreshProfile();
 
       // 7. Clean routing based on created profile
-      if (selectedRole === "RESPONDER") {
+      if (activeInvitation?.targetRole === "COMMAND") {
+        void navigate({ to: WORKSPACE_ROUTES.COMMAND || "/command/overview" });
+      }
+      else if (activeInvitation?.targetRole === "RESPONDER") {
+        void navigate({ to: WORKSPACE_ROUTES.RESPONDER || "/responder/overview" });
+      }
+      else if (selectedRole === "RESPONDER") {
         void navigate({ to: PENDING_RESPONDER_ROUTE });
       } else {
         void navigate({ to: WORKSPACE_ROUTES.CITIZEN || "/citizen/home" });
@@ -831,8 +905,28 @@ export function RegistrationWizard() {
             </span>
           </div>
 
-          {/* Account Category Selector */}
-          <fieldset className="space-y-2">
+          {/* Account Category Selector (Locked when accepting an Admin Invitation) */}
+          {activeInvitation ? (
+            <div className="rounded-md border border-signal/30 bg-signal/10 p-3.5 text-xs space-y-1.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-semibold text-foreground">Administrator-Authorized Invitation</span>
+                <span className="rounded bg-signal/20 px-2 py-0.5 text-[0.65rem] font-semibold text-signal uppercase">
+                  {activeInvitation.targetRole === "COMMAND"
+                    ? "Command Operations · Coordinator"
+                    : `Responder · ${activeInvitation.targetResponderSubtype}`}
+                </span>
+              </div>
+              {activeInvitation.targetRole === "RESPONDER" && (
+                <p className="text-muted-foreground">
+                  Assigned Operational Unit: <strong className="text-foreground">{activeInvitation.targetUnit}</strong> (locked by Administrator)
+                </p>
+              )}
+              <p className="text-muted-foreground">
+                Complete your personal and professional persona details below to activate your account.
+              </p>
+            </div>
+          ) : (
+            <fieldset className="space-y-2">
             <legend className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
               Select Account Category
             </legend>
@@ -884,6 +978,7 @@ export function RegistrationWizard() {
               )}
             </div>
           </fieldset>
+          )}
 
           {/* Common Personal Details */}
           <div className="space-y-4">
@@ -967,6 +1062,24 @@ export function RegistrationWizard() {
             </div>
           </div>
 
+          {/* Command Operations Persona Designation (Invitation Mode) */}
+          {activeInvitation?.targetRole === "COMMAND" && (
+            <div className="space-y-3 rounded-md border border-border bg-muted/30 p-4">
+              <h4 className="text-xs font-semibold text-foreground">Command Operations Persona</h4>
+              <div>
+                <label className="block text-xs font-semibold text-foreground">
+                  Command Designation (Optional)
+                  <Input
+                    placeholder="e.g., District Operations Coordinator"
+                    value={designation}
+                    onChange={(e) => setDesignation(e.target.value)}
+                    className="mt-1"
+                  />
+                </label>
+              </div>
+            </div>
+          )}
+
           {/* Additional Responder Specific Fields */}
           {selectedRole === "RESPONDER" && (
             <div className="space-y-4 rounded-md border border-signal/30 bg-signal/5 p-4">
@@ -975,6 +1088,7 @@ export function RegistrationWizard() {
                 <h4 className="text-xs font-semibold text-foreground">Operational Specialization</h4>
               </div>
 
+              {!activeInvitation && (
               <div className="grid gap-3 sm:grid-cols-2">
                 <div>
                   <label className="block text-xs font-semibold text-foreground">
@@ -1007,13 +1121,14 @@ export function RegistrationWizard() {
                   </label>
                 </div>
               </div>
+              )}
 
               <div className="grid gap-3 sm:grid-cols-2">
                 <div>
                   <label className="block text-xs font-semibold text-foreground">
-                    Agency / Organization Name
+                    {responderSubtype === "VOLUNTEER" ? "Organization / Community Group (Optional)" : "Agency / Organization Name"}
                     <Input
-                      required
+                      required={responderSubtype !== "VOLUNTEER"}
                       placeholder="e.g. SDRF, Red Cross, Civil Defense"
                       value={organization}
                       onChange={(e) => setOrganization(e.target.value)}
@@ -1024,9 +1139,9 @@ export function RegistrationWizard() {
 
                 <div>
                   <label className="block text-xs font-semibold text-foreground">
-                    Designation / Title
+                    {responderSubtype === "VOLUNTEER" ? "Volunteer Designation / Role (Optional)" : "Designation / Title"}
                     <Input
-                      required
+                      required={responderSubtype !== "VOLUNTEER"}
                       placeholder="e.g. Paramedic, Team Lead, Driver"
                       value={designation}
                       onChange={(e) => setDesignation(e.target.value)}

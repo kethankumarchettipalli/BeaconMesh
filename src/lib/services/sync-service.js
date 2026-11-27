@@ -1,6 +1,7 @@
-import { doc, setDoc, serverTimestamp } from "firebase/firestore";
+import { doc, getDoc, setDoc, updateDoc, serverTimestamp } from "firebase/firestore";
 import { auth, db, isFirebaseConfigured } from "../firebase";
 import { getLocalDb } from "../db/dexie-db";
+import { NOTIFICATION_EVENTS, createNotificationIdempotent } from "./notification-service";
 let isSyncing = false;
 let listenersInitialized = false;
 /**
@@ -59,9 +60,27 @@ export async function flushOutbox() {
                 let commitPayload = { ...item.payload };
                 if (item.actionType === "CREATE_INCIDENT") {
                     const currentUid = auth?.currentUser?.uid;
-                    const createdBy = commitPayload.createdBy || commitPayload.reporterId || currentUid;
                     if (!currentUid) {
                         // Cannot sync to Firestore without authentication (required by security rules)
+                        continue;
+                    }
+                    // Idempotency & stale-overwrite guard: if already in Firestore, reconcile local copy instead of overwriting
+                    const existingSnap = await getDoc(docRef);
+                    if (existingSnap.exists()) {
+                        const existingData = existingSnap.data();
+                        const localInc = await localDb.incidents.get(item.docId);
+                        if (localInc) {
+                            await localDb.incidents.update(item.docId, {
+                                syncStatus: "SYNCED",
+                                status: existingData.status || localInc.status,
+                                assignedResponderId: existingData.assignedResponderId ?? localInc.assignedResponderId ?? null,
+                                assignedResponderIds: existingData.assignedResponderId ? [existingData.assignedResponderId] : (localInc.assignedResponderIds || []),
+                                syncError: null,
+                                updatedAt: new Date().toISOString(),
+                            });
+                        }
+                        await localDb.outbox.delete(item.id);
+                        processed++;
                         continue;
                     }
                     // Strict whitelist matching firestore.rules isValidIncident()
@@ -80,8 +99,9 @@ export async function flushOutbox() {
                         createdAt: serverTimestamp(),
                         updatedAt: serverTimestamp(),
                     };
+                    await setDoc(docRef, commitPayload);
                 }
-                else if (item.actionType === "UPDATE_INCIDENT_STATUS" || item.actionType === "ASSIGN_INCIDENT") {
+                else if (item.actionType === "UPDATE_INCIDENT_STATUS") {
                     const updates = {
                         updatedAt: serverTimestamp(),
                     };
@@ -89,25 +109,26 @@ export async function flushOutbox() {
                         updates.status = String(commitPayload.status);
                     if (commitPayload.notes !== undefined)
                         updates.notes = commitPayload.notes ? String(commitPayload.notes) : null;
-                    if (commitPayload.assignedResponderId !== undefined) {
-                        updates.assignedResponderId = commitPayload.assignedResponderId ? String(commitPayload.assignedResponderId) : null;
-                    }
                     commitPayload = updates;
+                    await updateDoc(docRef, commitPayload);
                 }
                 else if (item.actionType === "CREATE_SAFE_ZONE" || item.actionType === "UPDATE_SAFE_ZONE") {
                     commitPayload = {
                         ...commitPayload,
                         updatedAt: serverTimestamp(),
                     };
+                    await setDoc(docRef, commitPayload, { merge: true });
                 }
                 else if (item.actionType === "UPDATE_RESPONDER_AVAILABILITY") {
                     commitPayload = {
                         ...commitPayload,
                         updatedAt: serverTimestamp(),
                     };
+                    await setDoc(docRef, commitPayload, { merge: true });
                 }
-                // Commit to Firestore with merge (idempotent, prevents duplicate documents)
-                await setDoc(docRef, commitPayload, { merge: true });
+                else {
+                    await setDoc(docRef, commitPayload, { merge: true });
+                }
                 // Update corresponding local records if needed
                 if (item.actionType === "CREATE_INCIDENT") {
                     const localInc = await localDb.incidents.get(item.docId);
@@ -115,22 +136,35 @@ export async function flushOutbox() {
                         await localDb.incidents.update(item.docId, {
                             syncStatus: "SYNCED",
                             status: "Waiting for connection",
+                            syncError: null,
                             updatedAt: new Date().toISOString(),
                         });
                     }
+                    const currentUid = auth?.currentUser?.uid;
+                    if (currentUid) {
+                        void createNotificationIdempotent({
+                            recipientUid: currentUid,
+                            eventType: NOTIFICATION_EVENTS.SOS_SYNCED,
+                            title: `SOS ${item.docId} synced to Command`,
+                            message: `Your SOS report ${item.docId} is now synchronized. Command Operations can receive and dispatch it.`,
+                            incidentId: item.docId,
+                            priority: "HIGH",
+                            sourceActorUid: currentUid,
+                            dedupKey: `SOS_SYNCED:${item.docId}`,
+                            metadata: { status: "Waiting for connection" },
+                        });
+                    }
                 }
-                else if (item.actionType === "UPDATE_INCIDENT_STATUS" || item.actionType === "ASSIGN_INCIDENT") {
+                else if (item.actionType === "UPDATE_INCIDENT_STATUS") {
                     const localInc = await localDb.incidents.get(item.docId);
                     if (localInc) {
                         const updates = {
                             syncStatus: "SYNCED",
+                            syncError: null,
                             updatedAt: new Date().toISOString(),
                         };
                         if (commitPayload.status)
                             updates.status = commitPayload.status;
-                        if (commitPayload.assignedResponderId !== undefined) {
-                            updates.assignedResponderIds = commitPayload.assignedResponderId ? [String(commitPayload.assignedResponderId)] : [];
-                        }
                         await localDb.incidents.update(item.docId, updates);
                     }
                 }
@@ -147,12 +181,13 @@ export async function flushOutbox() {
                     lastAttemptAt: new Date().toISOString(),
                     lastError: errMsg,
                 });
-                // Mark local incident as SYNC_FAILED so UI informs the user honestly
-                if (item.actionType === "CREATE_INCIDENT") {
+                // Mark local incident as SYNC_FAILED with error details so UI informs the user honestly
+                if (item.actionType === "CREATE_INCIDENT" || item.actionType === "UPDATE_INCIDENT_STATUS") {
                     const localInc = await localDb.incidents.get(item.docId);
                     if (localInc && localInc.syncStatus !== "SYNCED") {
                         await localDb.incidents.update(item.docId, {
                             syncStatus: "SYNC_FAILED",
+                            syncError: errMsg,
                             updatedAt: new Date().toISOString(),
                         });
                     }
