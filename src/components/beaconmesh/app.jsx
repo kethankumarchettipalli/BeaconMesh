@@ -2231,13 +2231,13 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
                     setProvEmailState({ status: "sent", messageId: emailRes.messageId });
                     setReviewFeedback({
                       type: "success",
-                      text: `Invitation created and email accepted for delivery to ${res.email}.`,
+                      text: `Invitation created and email accepted by SMTP server for ${res.email}.`,
                     });
                   } else {
                     setProvEmailState({ status: "failed", error: emailRes.error });
                     setReviewFeedback({
                       type: "error",
-                      text: `Invitation created, but email failed: ${emailRes.error}`,
+                      text: `Invitation created, but email sending failed: ${emailRes.error}`,
                     });
                   }
                 } catch (err) {
@@ -2316,15 +2316,15 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <p className="font-semibold text-safe">Invitation Ready (Expires in 7 days)</p>
                   {provEmailState?.status === "sending" && (
-                    <Pill tone="signal">Sending invitation…</Pill>
+                    <Pill tone="signal">Sending…</Pill>
                   )}
                   {provEmailState?.status === "sent" && (
                     <Pill tone="good">
-                      Accepted by provider (Resend){provEmailState.messageId ? ` · ${provEmailState.messageId}` : ""}
+                      Email accepted by SMTP server{provEmailState.messageId ? ` · ${provEmailState.messageId}` : ""}
                     </Pill>
                   )}
                   {provEmailState?.status === "failed" && (
-                    <Pill tone="warn">Email failed</Pill>
+                    <Pill tone="warn">Email sending failed</Pill>
                   )}
                 </div>
                 {provEmailState?.status === "failed" && (

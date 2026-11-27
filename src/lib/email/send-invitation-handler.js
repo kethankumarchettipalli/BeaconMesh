@@ -1,3 +1,4 @@
+import nodemailer from "nodemailer";
 import { buildInvitationEmailContent } from "./invitation-email-template.js";
 
 const DEFAULT_PRODUCTION_APP_URL = "https://beacon-mesh-eta.vercel.app";
@@ -8,10 +9,7 @@ const DUPLICATE_COOLDOWN_MS = 10_000;
 const adminRateMap = new Map();
 const recentInviteSendMap = new Map();
 
-function readEnv(env, key) {
-    if (env && typeof env[key] === "string" && env[key].trim()) {
-        return env[key].trim();
-    }
+function readServerEnv(key) {
     if (typeof process !== "undefined" && process.env && typeof process.env[key] === "string") {
         return process.env[key].trim();
     }
@@ -140,10 +138,10 @@ async function verifyPendingInvitation(invitationId, idToken, projectId) {
     };
 }
 
-export function buildCanonicalProductionInviteUrl(invitationId, email, env = null) {
+export function buildCanonicalProductionInviteUrl(invitationId, email) {
     const rawBase =
-        readEnv(env, "PUBLIC_APP_URL") ||
-        readEnv(env, "VITE_PUBLIC_APP_URL") ||
+        readServerEnv("PUBLIC_APP_URL") ||
+        readServerEnv("VITE_PUBLIC_APP_URL") ||
         DEFAULT_PRODUCTION_APP_URL;
     let baseUrl = DEFAULT_PRODUCTION_APP_URL;
     try {
@@ -158,7 +156,18 @@ export function buildCanonicalProductionInviteUrl(invitationId, email, env = nul
     return `${baseUrl}/signup?invite=${encodeURIComponent(invitationId)}&email=${encodeURIComponent(String(email || "").trim().toLowerCase())}`;
 }
 
-export async function handleSendInvitationEmail({ method, authorizationHeader, body, env = null }) {
+export function getSmtpConfigFromEnv() {
+    const host = readServerEnv("SMTP_HOST") || "smtp.gmail.com";
+    const port = Number(readServerEnv("SMTP_PORT") || "465") || 465;
+    const secureRaw = readServerEnv("SMTP_SECURE");
+    const secure = secureRaw ? secureRaw.toLowerCase() === "true" : port === 465;
+    const email = readServerEnv("SMTP_EMAIL");
+    const appPassword = readServerEnv("SMTP_APP_PASSWORD").replace(/\s+/g, "");
+    const fromName = readServerEnv("SMTP_FROM_NAME") || "BeaconMesh";
+    return { host, port, secure, email, appPassword, fromName };
+}
+
+export async function handleSendInvitationEmail({ method, authorizationHeader, body }) {
     if (method !== "POST") {
         return { status: 405, body: { error: "Method not allowed." } };
     }
@@ -169,16 +178,16 @@ export async function handleSendInvitationEmail({ method, authorizationHeader, b
         return { status: 401, body: { error: "Missing Bearer authorization token." } };
     }
 
-    const resendApiKey = readEnv(env, "RESEND_API_KEY");
-    if (!resendApiKey) {
+    const smtp = getSmtpConfigFromEnv();
+    if (!smtp.email || !smtp.appPassword) {
         return {
             status: 503,
-            body: { error: "Email service is not configured on the server (missing RESEND_API_KEY)." },
+            body: { error: "SMTP email service is not configured on the server (missing SMTP_EMAIL or SMTP_APP_PASSWORD)." },
         };
     }
 
-    const firebaseApiKey = readEnv(env, "FIREBASE_WEB_API_KEY") || readEnv(env, "VITE_FIREBASE_API_KEY");
-    const firebaseProjectId = readEnv(env, "FIREBASE_PROJECT_ID") || readEnv(env, "VITE_FIREBASE_PROJECT_ID");
+    const firebaseApiKey = readServerEnv("FIREBASE_WEB_API_KEY") || readServerEnv("VITE_FIREBASE_API_KEY");
+    const firebaseProjectId = readServerEnv("FIREBASE_PROJECT_ID") || readServerEnv("VITE_FIREBASE_PROJECT_ID");
 
     try {
         const authCheck = await verifyFirebaseAdministrator(idToken, firebaseApiKey, firebaseProjectId);
@@ -204,7 +213,7 @@ export async function handleSendInvitationEmail({ method, authorizationHeader, b
         }
 
         const inv = invCheck.invitation;
-        const inviteUrl = buildCanonicalProductionInviteUrl(inv.id, inv.email, env);
+        const inviteUrl = buildCanonicalProductionInviteUrl(inv.id, inv.email);
         const { subject, html, text } = buildInvitationEmailContent({
             fullName: inv.fullName,
             targetRole: inv.targetRole,
@@ -216,46 +225,68 @@ export async function handleSendInvitationEmail({ method, authorizationHeader, b
             expiresAtIso: inv.expiresAtIso,
         });
 
-        const fromAddress = readEnv(env, "RESEND_FROM_EMAIL") || "BeaconMesh <onboarding@resend.dev>";
+        const transporter = nodemailer.createTransport({
+            host: smtp.host,
+            port: smtp.port,
+            secure: smtp.secure,
+            auth: {
+                user: smtp.email,
+                pass: smtp.appPassword,
+            },
+            connectionTimeout: 10_000,
+            greetingTimeout: 10_000,
+            socketTimeout: 15_000,
+        });
+
+        const safeFromName = smtp.fromName.replace(/"/g, "");
         const idempotencyKey = allowResend
             ? `invite-${inv.id}-${Math.floor(Date.now() / 5000)}`
             : `invite-${inv.id}-initial`;
 
-        const resendRes = await fetch("https://api.resend.com/emails", {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${resendApiKey}`,
-                "Content-Type": "application/json",
-                "Idempotency-Key": idempotencyKey,
-            },
-            body: JSON.stringify({
-                from: fromAddress,
-                to: [inv.email],
+        try {
+            const info = await transporter.sendMail({
+                from: `"${safeFromName}" <${smtp.email}>`,
+                to: inv.email,
                 subject,
                 html,
                 text,
-            }),
-        });
+                headers: {
+                    "X-BeaconMesh-Invitation-Id": inv.id,
+                    "X-Idempotency-Key": idempotencyKey,
+                },
+            });
 
-        const resendBody = await resendRes.json().catch(() => ({}));
-        if (!resendRes.ok) {
             return {
-                status: 502,
+                status: 200,
                 body: {
-                    error: resendBody?.message || "Email provider rejected the invitation email request.",
+                    accepted: true,
+                    provider: "gmail-smtp",
+                    messageId: info?.messageId || null,
+                    acceptedRecipients: Array.isArray(info?.accepted) ? info.accepted : [inv.email],
+                    inviteUrl,
                 },
             };
         }
-
-        return {
-            status: 200,
-            body: {
-                accepted: true,
-                provider: "resend",
-                messageId: resendBody?.id || null,
-                inviteUrl,
-            },
-        };
+        catch (smtpErr) {
+            const code = smtpErr?.code || "";
+            const responseCode = smtpErr?.responseCode;
+            if (code === "EAUTH" || responseCode === 535 || responseCode === 534) {
+                return {
+                    status: 502,
+                    body: { error: "SMTP authentication failed. Verify Gmail SMTP credentials." },
+                };
+            }
+            if (code === "ETIMEDOUT" || code === "ESOCKET" || code === "ECONNECTION") {
+                return {
+                    status: 504,
+                    body: { error: "SMTP connection timed out. Please retry sending the email." },
+                };
+            }
+            return {
+                status: 502,
+                body: { error: smtpErr?.message || "SMTP server rejected the invitation email." },
+            };
+        }
     }
     catch (err) {
         console.error("[send-invitation-email] Unexpected error:", err?.message || "unknown");

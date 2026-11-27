@@ -1214,7 +1214,7 @@ export function buildInvitationUrl(invitationId, email, options = {}) {
 }
 
 /**
- * Request the server-side email endpoint to send (or resend) an invitation email via Resend.
+ * Request the server-side email endpoint to send (or resend) an invitation email via Gmail SMTP.
  */
 export async function sendPersonnelInvitationEmail({ invitationId, isRetry = false, isResend = false }) {
     if (!invitationId) {
@@ -1248,7 +1248,7 @@ export async function sendPersonnelInvitationEmail({ invitationId, isRetry = fal
         return {
             ok: true,
             status: "SENT",
-            provider: data?.provider || "resend",
+            provider: data?.provider || "gmail-smtp",
             messageId: data?.messageId || null,
             inviteUrl: data?.inviteUrl || null,
         };
