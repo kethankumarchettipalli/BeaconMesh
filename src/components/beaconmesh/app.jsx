@@ -609,8 +609,11 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
   const [profileSaving, setProfileSaving] = useState(false);
   const [profileError, setProfileError] = useState("");
   const [profileSuccess, setProfileSuccess] = useState("");
+  const [profileDirty, setProfileDirty] = useState(false);
   useEffect(() => {
     setProfileFullName(profile?.displayName || "BeaconMesh User");
+    if (profileDirty)
+      return;
     setProfilePhone(profile?.phoneNumber || "");
     setProfileRegion(profile?.region || "");
     setProfileDistrict(profile?.district || "");
@@ -630,7 +633,7 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
         // ignore localStorage parse error
       }
     }
-  }, [profile, user?.uid]);
+  }, [profile, user?.uid, profileDirty]);
 
   const refreshUsersAndApplications = async () => {
     setLoadingApplications(true);
@@ -1079,6 +1082,7 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
         if (typeof refreshProfile === "function") {
           await refreshProfile();
         }
+        setProfileDirty(false);
         setProfileSuccess("Personal details updated and synced to your BeaconMesh profile.");
       }
       catch (err) {
@@ -1422,7 +1426,10 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
             <Input
               value={profilePhone}
               placeholder="+91 98765 43210"
-              onChange={(e) => setProfilePhone(e.target.value)}
+              onChange={(e) => {
+                setProfileDirty(true);
+                setProfilePhone(e.target.value);
+              }}
               disabled={profileSaving}
               className="mt-2"
             />
@@ -1432,7 +1439,10 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
             <Input
               value={profileRegion}
               placeholder="Andhra Pradesh"
-              onChange={(e) => setProfileRegion(e.target.value)}
+              onChange={(e) => {
+                setProfileDirty(true);
+                setProfileRegion(e.target.value);
+              }}
               disabled={profileSaving}
               className="mt-2"
             />
@@ -1442,7 +1452,10 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
             <Input
               value={profileDistrict}
               placeholder="NTR District"
-              onChange={(e) => setProfileDistrict(e.target.value)}
+              onChange={(e) => {
+                setProfileDirty(true);
+                setProfileDistrict(e.target.value);
+              }}
               disabled={profileSaving}
               className="mt-2"
             />
@@ -1452,30 +1465,43 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
             <Input
               value={profileCity}
               placeholder="Vijayawada"
-              onChange={(e) => setProfileCity(e.target.value)}
+              onChange={(e) => {
+                setProfileDirty(true);
+                setProfileCity(e.target.value);
+              }}
               disabled={profileSaving}
               className="mt-2"
             />
           </label>
           <label className="text-sm font-medium">
             Language (this device)
-            <select value={profileLanguage} onChange={(e) => setProfileLanguage(e.target.value)} disabled={profileSaving} className="mt-2 h-10 w-full rounded-md border border-input bg-background px-3">
+            <select
+              value={profileLanguage}
+              onChange={(e) => {
+                setProfileDirty(true);
+                setProfileLanguage(e.target.value);
+              }}
+              disabled={profileSaving}
+              className="mt-2 h-10 w-full rounded-md border border-input bg-background px-3"
+            >
               <option>English</option>
               <option>Telugu</option>
               <option>Hindi</option>
             </select>
           </label>
-          <div className="sm:col-span-2">
-            <h3 className="font-semibold">Emergency contacts (this device)</h3>
-            <p className="mt-1 text-sm text-muted-foreground">{profileContacts}</p>
-            <Button type="button" variant="outline" className="mt-3" disabled={profileSaving} onClick={() => {
-              const updated = window.prompt("Enter emergency contact (Name · Phone):", profileContacts);
-              if (updated)
-                setProfileContacts(updated);
-            }}>
-              Edit contacts
-            </Button>
-          </div>
+          <label className="text-sm font-medium sm:col-span-2">
+            Emergency contacts (this device)
+            <Input
+              value={profileContacts}
+              placeholder="VMC Disaster Control · 0866-2424172"
+              onChange={(e) => {
+                setProfileDirty(true);
+                setProfileContacts(e.target.value);
+              }}
+              disabled={profileSaving}
+              className="mt-2"
+            />
+          </label>
           <div className="sm:col-span-2 flex flex-wrap items-center gap-4">
             <ThemeToggle />
             <span className="text-sm text-muted-foreground">
