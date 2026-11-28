@@ -2231,12 +2231,14 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
                     setProvEmailState({ status: "sent", messageId: emailRes.messageId });
                     setReviewFeedback({
                       type: "success",
+                      text: `Invitation created and email accepted for delivery to ${res.email}.`,
                       text: `Invitation created and email accepted by SMTP server for ${res.email}.`,
                     });
                   } else {
                     setProvEmailState({ status: "failed", error: emailRes.error });
                     setReviewFeedback({
                       type: "error",
+                      text: `Invitation created, but email failed: ${emailRes.error}`,
                       text: `Invitation created, but email sending failed: ${emailRes.error}`,
                     });
                   }

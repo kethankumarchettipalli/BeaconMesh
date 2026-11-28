@@ -271,6 +271,28 @@ describe("BeaconMesh SOS Workflow, State Machine & Race-Condition Tests", () => 
     expect(mockIncidents.get(rec.id).syncError).toBeNull();
   });
 
+  it("syncs new citizen SOS via setDoc even when getDoc on non-existent incident would throw permission-denied", async () => {
+    Object.defineProperty(navigator, "onLine", { value: false, configurable: true });
+    mockGetDoc.mockRejectedValue(new Error("Missing or insufficient permissions."));
+    mockSetDoc.mockResolvedValue(undefined);
+
+    const rec = await createEmergencyReport({
+      reporterId: "cit-1",
+      category: "Medical",
+      description: "Citizen SOS while online with WiFi",
+      location: { latitude: 16.4431, longitude: 80.6211, source: "GPS" },
+    });
+
+    Object.defineProperty(navigator, "onLine", { value: true, configurable: true });
+    const res = await flushOutbox();
+    expect(res.processed).toBe(1);
+    expect(res.failed).toBe(0);
+    expect(mockOutbox.size).toBe(0);
+    expect(mockSetDoc).toHaveBeenCalled();
+    expect(mockIncidents.get(rec.id).syncStatus).toBe("SYNCED");
+    expect(mockIncidents.get(rec.id).syncError).toBeNull();
+  });
+
   it("enforces full responder state machine: rejects skips, wrong responder, unaccepted OFFERED, and duplicate completion", async () => {
     seedTransactionalFixtures();
     await assignIncidentAtomic("BM-2611-TEST01", "resp-1", "coord-1");

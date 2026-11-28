@@ -64,24 +64,31 @@ export async function flushOutbox() {
                         // Cannot sync to Firestore without authentication (required by security rules)
                         continue;
                     }
-                    // Idempotency & stale-overwrite guard: if already in Firestore, reconcile local copy instead of overwriting
-                    const existingSnap = await getDoc(docRef);
-                    if (existingSnap.exists()) {
-                        const existingData = existingSnap.data();
-                        const localInc = await localDb.incidents.get(item.docId);
-                        if (localInc) {
-                            await localDb.incidents.update(item.docId, {
-                                syncStatus: "SYNCED",
-                                status: existingData.status || localInc.status,
-                                assignedResponderId: existingData.assignedResponderId ?? localInc.assignedResponderId ?? null,
-                                assignedResponderIds: existingData.assignedResponderId ? [existingData.assignedResponderId] : (localInc.assignedResponderIds || []),
-                                syncError: null,
-                                updatedAt: new Date().toISOString(),
-                            });
+                    // Idempotency & stale-overwrite guard: if already in Firestore, reconcile local copy instead of overwriting.
+                    // Note: Reading a non-existent incident by a Citizen throws permission-denied because resource is null in rules;
+                    // ignore that read error and proceed to setDoc (create).
+                    try {
+                        const existingSnap = await getDoc(docRef);
+                        if (existingSnap.exists()) {
+                            const existingData = existingSnap.data();
+                            const localInc = await localDb.incidents.get(item.docId);
+                            if (localInc) {
+                                await localDb.incidents.update(item.docId, {
+                                    syncStatus: "SYNCED",
+                                    status: existingData.status || localInc.status,
+                                    assignedResponderId: existingData.assignedResponderId ?? localInc.assignedResponderId ?? null,
+                                    assignedResponderIds: existingData.assignedResponderId ? [existingData.assignedResponderId] : (localInc.assignedResponderIds || []),
+                                    syncError: null,
+                                    updatedAt: new Date().toISOString(),
+                                });
+                            }
+                            await localDb.outbox.delete(item.id);
+                            processed++;
+                            continue;
                         }
-                        await localDb.outbox.delete(item.id);
-                        processed++;
-                        continue;
+                    }
+                    catch {
+                        // Proceed to setDoc when document does not exist yet
                     }
                     // Strict whitelist matching firestore.rules isValidIncident()
                     commitPayload = {
