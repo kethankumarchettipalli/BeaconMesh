@@ -30,6 +30,7 @@ describe("App routing", () => {
             "/responder/incidents/BM-2408-018",
             "/responder/field-map",
             "/responder/status",
+            "/responder/profile",
             "/command",
             "/command/overview",
             "/command/map",
@@ -37,6 +38,7 @@ describe("App routing", () => {
             "/command/simulation",
             "/command/messages",
             "/command/users",
+            "/command/profile",
         ];
         for (const path of paths) {
             expect(router.matchRoutes(path).at(-1)?.routeId, path).not.toBe(rootRouteId);

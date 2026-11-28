@@ -96,6 +96,7 @@ const sections = {
       { label: "Overview", href: "/responder/overview", icon: Home },
       { label: "Field map", href: "/responder/field-map", icon: Map },
       { label: "Status updates", href: "/responder/status", icon: Activity },
+      { label: "Profile", href: "/responder/profile", icon: Settings },
     ],
   },
   COMMAND: {
@@ -107,6 +108,7 @@ const sections = {
       { label: "Simulation lab", href: "/command/simulation", icon: Network },
       { label: "Message intelligence", href: "/command/messages", icon: Radio },
       { label: "User management", href: "/command/users", icon: Users },
+      { label: "Profile", href: "/command/profile", icon: Settings },
     ],
   },
 };
@@ -118,6 +120,7 @@ const titleMap = {
   "/responder/overview": "Field overview",
   "/responder/field-map": "Field map",
   "/responder/status": "Status updates",
+  "/responder/profile": "Profile & settings",
   "/responder/application-pending": "Application pending",
   "/command/overview": "Command overview",
   "/command/map": "Live operations map",
@@ -125,6 +128,7 @@ const titleMap = {
   "/command/simulation": "Simulation laboratory",
   "/command/messages": "Message intelligence",
   "/command/users": "User management",
+  "/command/profile": "Profile & settings",
   "/login": "Welcome back",
   "/signup": "Create your account",
   "/forgot-password": "Reset your password",
@@ -508,7 +512,7 @@ function MapPlaceholder({ title = "Operations area", compact = false, }) {
   </div>);
 }
 function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = [], onRefresh, }) {
-  const { user, profile } = useAuth();
+  const { user, profile, refreshProfile } = useAuth();
   const [category, setCategory] = useState("Medical");
   const [description, setDescription] = useState("");
   const [message, setMessage] = useState("");
@@ -595,17 +599,38 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
   const [reviewSubmitting, setReviewSubmitting] = useState(false);
   const [reviewFeedback, setReviewFeedback] = useState(null);
   // Profile preferences state
-  const [profileFullName, setProfileFullName] = useState(profile?.displayName || "Citizen User");
-  const [profilePhone, setProfilePhone] = useState(profile?.phoneNumber || "+91 866 242 4172");
-  const [profileRegion, setProfileRegion] = useState("Vijayawada, NTR District");
+  const [profileFullName, setProfileFullName] = useState(profile?.displayName || "BeaconMesh User");
+  const [profilePhone, setProfilePhone] = useState(profile?.phoneNumber || "");
+  const [profileRegion, setProfileRegion] = useState(profile?.region || "");
+  const [profileDistrict, setProfileDistrict] = useState(profile?.district || "");
+  const [profileCity, setProfileCity] = useState(profile?.city || "");
   const [profileLanguage, setProfileLanguage] = useState("English");
   const [profileContacts, setProfileContacts] = useState("VMC Disaster Control · 0866-2424172");
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileError, setProfileError] = useState("");
+  const [profileSuccess, setProfileSuccess] = useState("");
   useEffect(() => {
-    if (profile?.displayName)
-      setProfileFullName(profile.displayName);
-    if (profile?.phoneNumber)
-      setProfilePhone(profile.phoneNumber);
-  }, [profile]);
+    setProfileFullName(profile?.displayName || "BeaconMesh User");
+    setProfilePhone(profile?.phoneNumber || "");
+    setProfileRegion(profile?.region || "");
+    setProfileDistrict(profile?.district || "");
+    setProfileCity(profile?.city || "");
+    if (typeof window !== "undefined" && user?.uid) {
+      try {
+        const raw = window.localStorage.getItem(`beaconmesh-prefs-${user.uid}`);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed.language)
+            setProfileLanguage(parsed.language);
+          if (parsed.emergencyContacts)
+            setProfileContacts(parsed.emergencyContacts);
+        }
+      }
+      catch {
+        // ignore localStorage parse error
+      }
+    }
+  }, [profile, user?.uid]);
 
   const refreshUsersAndApplications = async () => {
     setLoadingApplications(true);
@@ -1038,23 +1063,33 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
   };
   const handleSavePreferences = async (e) => {
     e.preventDefault();
+    setProfileError("");
+    setProfileSuccess("");
     if (user?.uid) {
+      setProfileSaving(true);
       try {
         await updateUserPreferences(user.uid, {
-          displayName: profileFullName,
           phoneNumber: profilePhone,
           region: profileRegion,
+          district: profileDistrict,
+          city: profileCity,
           language: profileLanguage,
           emergencyContacts: profileContacts,
         });
-        setMessage("Your profile preferences have been successfully updated in Firebase & locally.");
+        if (typeof refreshProfile === "function") {
+          await refreshProfile();
+        }
+        setProfileSuccess("Personal details updated and synced to your BeaconMesh profile.");
       }
-      catch {
-        setMessage("Your preferences have been saved on this device.");
+      catch (err) {
+        setProfileError(`Failed to update profile: ${err?.message || "Permission denied or offline."}`);
+      }
+      finally {
+        setProfileSaving(false);
       }
     }
     else {
-      setMessage("Your preview preferences have been saved on this device.");
+      setProfileSuccess("Your preview preferences have been saved on this device.");
     }
   };
   if (path.startsWith("/auth"))
@@ -1287,56 +1322,183 @@ function DashboardContent({ path, role, incidents, setIncidents, rawIncidents = 
         </p>
       </aside>
     </div>);
-  if (path.endsWith("/profile"))
-    return (<div className="max-w-3xl">
-      <Pill tone="signal">{user ? "Authenticated Account" : "Preview Account"}</Pill>
-      <h2 className="mt-4 font-display text-2xl font-semibold">Your details</h2>
-      <form onSubmit={handleSavePreferences} className="mt-6 grid gap-5 sm:grid-cols-2">
-        <label className="text-sm font-medium">
-          Full name
-          <Input value={profileFullName} onChange={(e) => setProfileFullName(e.target.value)} className="mt-2" />
-        </label>
-        <label className="text-sm font-medium">
-          Phone number
-          <Input value={profilePhone} onChange={(e) => setProfilePhone(e.target.value)} className="mt-2" />
-        </label>
-        <label className="text-sm font-medium">
-          Region / Jurisdiction
-          <Input value={profileRegion} onChange={(e) => setProfileRegion(e.target.value)} className="mt-2" />
-        </label>
-        <label className="text-sm font-medium">
-          Language
-          <select value={profileLanguage} onChange={(e) => setProfileLanguage(e.target.value)} className="mt-2 h-10 w-full rounded-md border border-input bg-background px-3">
-            <option>English</option>
-            <option>Telugu</option>
-            <option>Hindi</option>
-          </select>
-        </label>
-        <div className="sm:col-span-2">
-          <h3 className="font-semibold">Emergency contacts</h3>
-          <p className="mt-1 text-sm text-muted-foreground">{profileContacts}</p>
-          <Button type="button" variant="outline" className="mt-3" onClick={() => {
-            const updated = window.prompt("Enter emergency contact (Name · Phone):", profileContacts);
-            if (updated)
-              setProfileContacts(updated);
-          }}>
-            Edit contacts
+  if (path.endsWith("/profile")) {
+    const activeRoleLabel = profile?.role === "COMMAND"
+      ? `Command · ${profile.commandLevel || "COORDINATOR"}`
+      : profile?.role === "RESPONDER"
+        ? `${profile.responderSubtype || "VOLUNTEER"} Responder`
+        : "Citizen";
+    const capList = Array.isArray(profile?.capabilities) && profile.capabilities.length > 0
+      ? profile.capabilities.join(", ")
+      : profile?.role || "CITIZEN";
+    return (<div className="max-w-3xl space-y-6">
+      <div className="flex flex-wrap items-center gap-2">
+        <Pill tone="signal">{user ? "Authenticated Account" : "Preview Account"}</Pill>
+        <Pill tone={profile?.accountStatus === "ACTIVE" ? "good" : "neutral"}>
+          {profile?.accountStatus || "ACTIVE"}
+        </Pill>
+        <Pill tone="neutral">{activeRoleLabel}</Pill>
+      </div>
+
+      {/* Read-Only Account & Role Identity */}
+      <section className="rounded-lg border border-border bg-card p-5 space-y-4">
+        <div>
+          <p className="section-kicker">ACCOUNT &amp; ROLE STANDING (READ-ONLY)</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Your name, email, role, and operational authority are locked and cannot be modified from profile settings.
+          </p>
+        </div>
+        <div className="grid gap-3 text-xs sm:grid-cols-2">
+          <div>
+            <span className="text-muted-foreground">Full Name:</span>{" "}
+            <strong className="text-foreground">{profileFullName}</strong>
+          </div>
+          <div>
+            <span className="text-muted-foreground">Email:</span>{" "}
+            <strong className="text-foreground">{profile?.email || user?.email || "—"}</strong>{" "}
+            {user?.emailVerified && <span className="text-safe font-semibold">(Verified)</span>}
+          </div>
+          <div>
+            <span className="text-muted-foreground">Role:</span>{" "}
+            <strong className="text-foreground">{activeRoleLabel}</strong>
+          </div>
+          <div>
+            <span className="text-muted-foreground">Capabilities:</span>{" "}
+            <strong className="text-foreground">{capList}</strong>
+          </div>
+          {profile?.role === "RESPONDER" && (
+            <>
+              <div>
+                <span className="text-muted-foreground">Operational Unit:</span>{" "}
+                <strong className="text-foreground">{profile.requestedUnit || "GENERAL"}</strong>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Duty Status:</span>{" "}
+                <strong className="text-foreground">{profile.dutyStatus || "OFF_DUTY"}</strong>
+              </div>
+              {profile.organization && (
+                <div>
+                  <span className="text-muted-foreground">Organization:</span>{" "}
+                  <strong className="text-foreground">{profile.organization}</strong>
+                </div>
+              )}
+              {profile.designation && (
+                <div>
+                  <span className="text-muted-foreground">Designation:</span>{" "}
+                  <strong className="text-foreground">{profile.designation}</strong>
+                </div>
+              )}
+              {profile.experienceYears !== null && profile.experienceYears !== undefined && (
+                <div>
+                  <span className="text-muted-foreground">Experience:</span>{" "}
+                  <strong className="text-foreground">{profile.experienceYears} years</strong>
+                </div>
+              )}
+              <div>
+                <span className="text-muted-foreground">Approval Status:</span>{" "}
+                <strong className="text-foreground">{profile.approvalStatus || "APPROVED"}</strong>
+              </div>
+            </>
+          )}
+          {profile?.role === "COMMAND" && (
+            <div>
+              <span className="text-muted-foreground">Command Level:</span>{" "}
+              <strong className="text-foreground">{profile.commandLevel || "COORDINATOR"}</strong>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* Editable Personal Details */}
+      <section>
+        <h2 className="font-display text-xl font-semibold">Editable personal details</h2>
+        <form onSubmit={handleSavePreferences} className="mt-4 grid gap-5 sm:grid-cols-2">
+          <label className="text-sm font-medium">
+            Full name (locked)
+            <Input value={profileFullName} disabled readOnly aria-readonly="true" className="mt-2 opacity-70 cursor-not-allowed" />
+          </label>
+          <label className="text-sm font-medium">
+            Phone number
+            <Input
+              value={profilePhone}
+              placeholder="+91 98765 43210"
+              onChange={(e) => setProfilePhone(e.target.value)}
+              disabled={profileSaving}
+              className="mt-2"
+            />
+          </label>
+          <label className="text-sm font-medium">
+            Region / State
+            <Input
+              value={profileRegion}
+              placeholder="Andhra Pradesh"
+              onChange={(e) => setProfileRegion(e.target.value)}
+              disabled={profileSaving}
+              className="mt-2"
+            />
+          </label>
+          <label className="text-sm font-medium">
+            District
+            <Input
+              value={profileDistrict}
+              placeholder="NTR District"
+              onChange={(e) => setProfileDistrict(e.target.value)}
+              disabled={profileSaving}
+              className="mt-2"
+            />
+          </label>
+          <label className="text-sm font-medium">
+            City
+            <Input
+              value={profileCity}
+              placeholder="Vijayawada"
+              onChange={(e) => setProfileCity(e.target.value)}
+              disabled={profileSaving}
+              className="mt-2"
+            />
+          </label>
+          <label className="text-sm font-medium">
+            Language (this device)
+            <select value={profileLanguage} onChange={(e) => setProfileLanguage(e.target.value)} disabled={profileSaving} className="mt-2 h-10 w-full rounded-md border border-input bg-background px-3">
+              <option>English</option>
+              <option>Telugu</option>
+              <option>Hindi</option>
+            </select>
+          </label>
+          <div className="sm:col-span-2">
+            <h3 className="font-semibold">Emergency contacts (this device)</h3>
+            <p className="mt-1 text-sm text-muted-foreground">{profileContacts}</p>
+            <Button type="button" variant="outline" className="mt-3" disabled={profileSaving} onClick={() => {
+              const updated = window.prompt("Enter emergency contact (Name · Phone):", profileContacts);
+              if (updated)
+                setProfileContacts(updated);
+            }}>
+              Edit contacts
+            </Button>
+          </div>
+          <div className="sm:col-span-2 flex flex-wrap items-center gap-4">
+            <ThemeToggle />
+            <span className="text-sm text-muted-foreground">
+              Theme preference is saved on this device
+            </span>
+          </div>
+          <Button type="submit" disabled={profileSaving} className="sm:col-span-2 sm:w-fit">
+            {profileSaving ? "Saving…" : "Save personal details"}
           </Button>
-        </div>
-        <div className="sm:col-span-2 flex flex-wrap items-center gap-4">
-          <ThemeToggle />
-          <span className="text-sm text-muted-foreground">
-            Theme preference is saved on this device
-          </span>
-        </div>
-        <Button type="submit" className="sm:col-span-2 sm:w-fit">
-          Save preferences
-        </Button>
-        {message && (<p role="status" className="text-sm text-safe sm:col-span-2">
-          {message}
-        </p>)}
-      </form>
+          {profileError && (
+            <p role="alert" className="text-sm text-urgent sm:col-span-2">
+              {profileError}
+            </p>
+          )}
+          {profileSuccess && (
+            <p role="status" className="text-sm text-safe sm:col-span-2">
+              {profileSuccess}
+            </p>
+          )}
+        </form>
+      </section>
     </div>);
+  }
   if (path.endsWith("/status")) {
     const activeAssigned = (rawIncidents || []).find(
       (i) => user?.uid && i.assignedResponderId === user.uid && !["Resolved", "Closed", "Cancelled"].includes(i.status)
@@ -4288,7 +4450,7 @@ export function BeaconPage() {
           {path.startsWith("/responder/incidents/") ? (<DashboardContent path="/citizen/reports" role={routeRole} incidents={incidents} setIncidents={setIncidents} rawIncidents={rawIncidents} onRefresh={loadIncidents} />) : (<DashboardContent path={path} role={routeRole} incidents={incidents} setIncidents={setIncidents} rawIncidents={rawIncidents} onRefresh={loadIncidents} />)}
         </div>
       </main>
-      <nav aria-label="Mobile navigation" className={`fixed inset-x-0 bottom-0 z-30 grid border-t border-border bg-background/95 px-1 pb-[env(safe-area-inset-bottom)] backdrop-blur lg:hidden ${isCitizen || isResponder ? "grid-cols-4" : "grid-cols-3"} ${!isCitizen && !isResponder ? "grid-rows-2" : "grid-rows-1"}`}>
+      <nav aria-label="Mobile navigation" className={`fixed inset-x-0 bottom-0 z-30 grid grid-cols-4 border-t border-border bg-background/95 px-1 pb-[env(safe-area-inset-bottom)] backdrop-blur lg:hidden ${!isCitizen && !isResponder ? "grid-rows-2" : "grid-rows-1"}`}>
         {(isCitizen
           ? sections.CITIZEN.links
           : isResponder

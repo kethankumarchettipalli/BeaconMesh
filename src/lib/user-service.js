@@ -290,29 +290,57 @@ export async function updateProfileEmailVerified(uid) {
     }
 }
 /**
- * Update non-privileged user profile settings (name, phone, region, emergency contacts)
+ * Update non-privileged personal details (phone, region, district, city) in Firestore
+ * and device-local preferences (language, emergencyContacts) in localStorage.
+ * Name (displayName) and role/privilege fields are strictly immutable here.
  */
 export async function updateUserPreferences(uid, params) {
-    const allowedUpdates = {
-        updatedAt: new Date().toISOString(),
+    if (!uid) {
+        throw new Error("User ID is required to update profile details.");
+    }
+    const cleanOptional = (val, maxLen) => {
+        if (val === undefined)
+            return undefined;
+        const trimmed = String(val ?? "").trim();
+        return trimmed ? trimmed.slice(0, maxLen) : null;
     };
-    if (params.displayName !== undefined)
-        allowedUpdates.displayName = params.displayName;
-    if (params.phoneNumber !== undefined)
-        allowedUpdates.phoneNumber = params.phoneNumber;
-    if (params.region !== undefined)
-        allowedUpdates.region = params.region;
-    if (params.language !== undefined)
-        allowedUpdates.language = params.language;
-    if (params.emergencyContacts !== undefined)
-        allowedUpdates.emergencyContacts = params.emergencyContacts;
-    if (db && typeof navigator !== "undefined" && navigator.onLine) {
+
+    const firestoreUpdates = {
+        updatedAt: serverTimestamp(),
+    };
+    const phone = cleanOptional(params.phoneNumber, 30);
+    if (phone !== undefined)
+        firestoreUpdates.phoneNumber = phone;
+    const region = cleanOptional(params.region, 100);
+    if (region !== undefined)
+        firestoreUpdates.region = region;
+    const district = cleanOptional(params.district, 100);
+    if (district !== undefined)
+        firestoreUpdates.district = district;
+    const city = cleanOptional(params.city, 100);
+    if (city !== undefined)
+        firestoreUpdates.city = city;
+
+    if (typeof window !== "undefined" && window.localStorage) {
         try {
-            const docRef = doc(db, "users", uid);
-            await updateDoc(docRef, allowedUpdates);
+            const prefs = {};
+            if (params.language !== undefined)
+                prefs.language = String(params.language);
+            if (params.emergencyContacts !== undefined)
+                prefs.emergencyContacts = String(params.emergencyContacts);
+            window.localStorage.setItem(`beaconmesh-prefs-${uid}`, JSON.stringify(prefs));
         }
-        catch (err) {
-            console.warn("Firestore updateUserPreferences fallback:", err);
+        catch {
+            // ignore localStorage quota errors
         }
     }
+
+    if (!db) {
+        throw new Error("Cloud database is not configured.");
+    }
+    if (typeof navigator !== "undefined" && !navigator.onLine) {
+        throw new Error("Cannot update cloud profile while offline.");
+    }
+    const docRef = doc(db, "users", uid);
+    await updateDoc(docRef, firestoreUpdates);
 }

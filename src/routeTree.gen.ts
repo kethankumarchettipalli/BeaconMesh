@@ -26,12 +26,14 @@ import { Route as CommandIncidentsRouteImport } from './routes/command/incidents
 import { Route as CommandMapRouteImport } from './routes/command/map'
 import { Route as CommandMessagesRouteImport } from './routes/command/messages'
 import { Route as CommandOverviewRouteImport } from './routes/command/overview'
+import { Route as CommandProfileRouteImport } from './routes/command/profile'
 import { Route as CommandSimulationRouteImport } from './routes/command/simulation'
 import { Route as CommandUsersRouteImport } from './routes/command/users'
 import { Route as ResponderIndexRouteImport } from './routes/responder/index'
 import { Route as ResponderApplicationPendingRouteImport } from './routes/responder/application-pending'
 import { Route as ResponderFieldMapRouteImport } from './routes/responder/field-map'
 import { Route as ResponderOverviewRouteImport } from './routes/responder/overview'
+import { Route as ResponderProfileRouteImport } from './routes/responder/profile'
 import { Route as ResponderStatusRouteImport } from './routes/responder/status'
 import { Route as ResponderIncidentsIncidentIdRouteImport } from './routes/responder/incidents/$incidentId'
 
@@ -120,6 +122,11 @@ const CommandOverviewRoute = CommandOverviewRouteImport.update({
   path: '/command/overview',
   getParentRoute: () => rootRouteImport,
 } as any)
+const CommandProfileRoute = CommandProfileRouteImport.update({
+  id: '/command/profile',
+  path: '/command/profile',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const CommandSimulationRoute = CommandSimulationRouteImport.update({
   id: '/command/simulation',
   path: '/command/simulation',
@@ -151,6 +158,11 @@ const ResponderOverviewRoute = ResponderOverviewRouteImport.update({
   path: '/responder/overview',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ResponderProfileRoute = ResponderProfileRouteImport.update({
+  id: '/responder/profile',
+  path: '/responder/profile',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ResponderStatusRoute = ResponderStatusRouteImport.update({
   id: '/responder/status',
   path: '/responder/status',
@@ -179,11 +191,13 @@ export interface FileRoutesByFullPath {
   '/command/map': typeof CommandMapRoute
   '/command/messages': typeof CommandMessagesRoute
   '/command/overview': typeof CommandOverviewRoute
+  '/command/profile': typeof CommandProfileRoute
   '/command/simulation': typeof CommandSimulationRoute
   '/command/users': typeof CommandUsersRoute
   '/responder/application-pending': typeof ResponderApplicationPendingRoute
   '/responder/field-map': typeof ResponderFieldMapRoute
   '/responder/overview': typeof ResponderOverviewRoute
+  '/responder/profile': typeof ResponderProfileRoute
   '/responder/status': typeof ResponderStatusRoute
   '/citizen/': typeof CitizenIndexRoute
   '/command/': typeof CommandIndexRoute
@@ -206,11 +220,13 @@ export interface FileRoutesByTo {
   '/command/map': typeof CommandMapRoute
   '/command/messages': typeof CommandMessagesRoute
   '/command/overview': typeof CommandOverviewRoute
+  '/command/profile': typeof CommandProfileRoute
   '/command/simulation': typeof CommandSimulationRoute
   '/command/users': typeof CommandUsersRoute
   '/responder/application-pending': typeof ResponderApplicationPendingRoute
   '/responder/field-map': typeof ResponderFieldMapRoute
   '/responder/overview': typeof ResponderOverviewRoute
+  '/responder/profile': typeof ResponderProfileRoute
   '/responder/status': typeof ResponderStatusRoute
   '/citizen': typeof CitizenIndexRoute
   '/command': typeof CommandIndexRoute
@@ -234,11 +250,13 @@ export interface FileRoutesById {
   '/command/map': typeof CommandMapRoute
   '/command/messages': typeof CommandMessagesRoute
   '/command/overview': typeof CommandOverviewRoute
+  '/command/profile': typeof CommandProfileRoute
   '/command/simulation': typeof CommandSimulationRoute
   '/command/users': typeof CommandUsersRoute
   '/responder/application-pending': typeof ResponderApplicationPendingRoute
   '/responder/field-map': typeof ResponderFieldMapRoute
   '/responder/overview': typeof ResponderOverviewRoute
+  '/responder/profile': typeof ResponderProfileRoute
   '/responder/status': typeof ResponderStatusRoute
   '/citizen/': typeof CitizenIndexRoute
   '/command/': typeof CommandIndexRoute
@@ -263,11 +281,13 @@ export interface FileRouteTypes {
     | '/command/map'
     | '/command/messages'
     | '/command/overview'
+    | '/command/profile'
     | '/command/simulation'
     | '/command/users'
     | '/responder/application-pending'
     | '/responder/field-map'
     | '/responder/overview'
+    | '/responder/profile'
     | '/responder/status'
     | '/citizen/'
     | '/command/'
@@ -290,11 +310,13 @@ export interface FileRouteTypes {
     | '/command/map'
     | '/command/messages'
     | '/command/overview'
+    | '/command/profile'
     | '/command/simulation'
     | '/command/users'
     | '/responder/application-pending'
     | '/responder/field-map'
     | '/responder/overview'
+    | '/responder/profile'
     | '/responder/status'
     | '/citizen'
     | '/command'
@@ -317,11 +339,13 @@ export interface FileRouteTypes {
     | '/command/map'
     | '/command/messages'
     | '/command/overview'
+    | '/command/profile'
     | '/command/simulation'
     | '/command/users'
     | '/responder/application-pending'
     | '/responder/field-map'
     | '/responder/overview'
+    | '/responder/profile'
     | '/responder/status'
     | '/citizen/'
     | '/command/'
@@ -345,11 +369,13 @@ export interface RootRouteChildren {
   CommandMapRoute: typeof CommandMapRoute
   CommandMessagesRoute: typeof CommandMessagesRoute
   CommandOverviewRoute: typeof CommandOverviewRoute
+  CommandProfileRoute: typeof CommandProfileRoute
   CommandSimulationRoute: typeof CommandSimulationRoute
   CommandUsersRoute: typeof CommandUsersRoute
   ResponderApplicationPendingRoute: typeof ResponderApplicationPendingRoute
   ResponderFieldMapRoute: typeof ResponderFieldMapRoute
   ResponderOverviewRoute: typeof ResponderOverviewRoute
+  ResponderProfileRoute: typeof ResponderProfileRoute
   ResponderStatusRoute: typeof ResponderStatusRoute
   CitizenIndexRoute: typeof CitizenIndexRoute
   CommandIndexRoute: typeof CommandIndexRoute
@@ -478,6 +504,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof CommandOverviewRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/command/profile': {
+      id: '/command/profile'
+      path: '/command/profile'
+      fullPath: '/command/profile'
+      preLoaderRoute: typeof CommandProfileRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/command/simulation': {
       id: '/command/simulation'
       path: '/command/simulation'
@@ -520,6 +553,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ResponderOverviewRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/responder/profile': {
+      id: '/responder/profile'
+      path: '/responder/profile'
+      fullPath: '/responder/profile'
+      preLoaderRoute: typeof ResponderProfileRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/responder/status': {
       id: '/responder/status'
       path: '/responder/status'
@@ -553,11 +593,13 @@ const rootRouteChildren: RootRouteChildren = {
   CommandMapRoute: CommandMapRoute,
   CommandMessagesRoute: CommandMessagesRoute,
   CommandOverviewRoute: CommandOverviewRoute,
+  CommandProfileRoute: CommandProfileRoute,
   CommandSimulationRoute: CommandSimulationRoute,
   CommandUsersRoute: CommandUsersRoute,
   ResponderApplicationPendingRoute: ResponderApplicationPendingRoute,
   ResponderFieldMapRoute: ResponderFieldMapRoute,
   ResponderOverviewRoute: ResponderOverviewRoute,
+  ResponderProfileRoute: ResponderProfileRoute,
   ResponderStatusRoute: ResponderStatusRoute,
   CitizenIndexRoute: CitizenIndexRoute,
   CommandIndexRoute: CommandIndexRoute,
